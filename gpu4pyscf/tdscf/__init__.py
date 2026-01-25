@@ -17,3 +17,4 @@ from gpu4pyscf.tdscf import rhf
 from gpu4pyscf.tdscf import uhf
 from gpu4pyscf.tdscf import rks
 from gpu4pyscf.tdscf import uks
+from gpu4pyscf.tdscf import rt_tddft
