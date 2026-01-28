@@ -34,9 +34,13 @@ class RTTDDFT(lib.StreamObject):
         self.x_inv = v @ cupy.diag(e**(0.5)) @ v.T
         
         # Purification parameter
-        self.purify_interval = None 
         self.mu_spin = 'total' # 'total', 'alpha', 'beta'
         self.record_occ = False # Track MO populations
+        
+        # Checkpointing
+        self.checkpoint_interval = None
+        self.checkpoint_file = 'rt_restart.npz'
+        self.restart_from = None
 
     def kernel(self, times, dm0=None, dt=0.02, propagator='magnus_step', callback=None):
         '''
@@ -53,6 +57,20 @@ class RTTDDFT(lib.StreamObject):
             dict: Results containing 'dip' (dipole moments), 'energy', 'dm' (final density).
         '''
         log = logger.new_logger(self, self.verbose)
+        
+        # Handle Restart
+        t_start = 0.0
+        if self.restart_from:
+            log.info(f"Restarting calculation from {self.restart_from}")
+            try:
+                data = np.load(self.restart_from)
+                t_start = float(data['time'])
+                dm0 = data['dm']
+                log.info(f"Resuming from t = {t_start:.4f} au")
+            except Exception as e:
+                log.warn(f"Failed to load restart file: {e}. Starting from scratch.")
+                self.restart_from = None
+
         if dm0 is None:
             dm0 = self.ks.make_rdm1()
         
@@ -98,7 +116,7 @@ class RTTDDFT(lib.StreamObject):
             ints_mu = cupy.asarray(self.mol.intor('int1e_r'))
         
         # Time loop
-        t_now = 0.0
+        t_now = t_start
         results = {
             'times': [],
             'dip': [],
@@ -113,14 +131,18 @@ class RTTDDFT(lib.StreamObject):
         elif self.record_occ:
             results['occ'] = []
         
-        # Initial properties
-        self._record(0.0, dm_ao, results)
-        if callback is not None:
-            callback(0.0, dm_ao, results)
+        # Initial properties (only if starting from 0, otherwise we assume history is handled elsewhere or ignored)
+        # Note: If restarting, we might duplicate the first point if we record immediately.
+        # Ideally, we record if t_now is in times.
+        # But standard behavior is to record initial state.
+        if t_now == 0.0:
+            self._record(t_now, dm_ao, results)
+            if callback is not None:
+                callback(t_now, dm_ao, results)
         
         total_steps = 0
         for t_target in times:
-            if t_target <= t_now: continue
+            if t_target <= t_now + 1e-6: continue # Skip past times
             
             steps = int(np.round((t_target - t_now) / dt))
             for step in range(steps):
@@ -169,6 +191,11 @@ class RTTDDFT(lib.StreamObject):
                     raise ValueError(f"Unknown propagator: {propagator}")
                 
                 t_now += dt
+                
+                # Checkpoint
+                if self.checkpoint_interval and total_steps % self.checkpoint_interval == 0:
+                    dm_curr = cupy.asnumpy(self.to_ao(dm_orth))
+                    np.savez(self.checkpoint_file, time=t_now, dm=dm_curr)
             
             # Convert back to AO for recording
             dm_ao = self.to_ao(dm_orth)
@@ -178,6 +205,10 @@ class RTTDDFT(lib.StreamObject):
             log.info(f"Time: {t_now:10.4f} au | Energy: {results['energy'][-1]:20.12f}")
 
         results['dm'] = cupy.asnumpy(dm_ao)
+        # Final checkpoint
+        if self.checkpoint_interval:
+             np.savez(self.checkpoint_file, time=t_now, dm=results['dm'])
+             
         return results
 
     def to_ao(self, dm_orth):
