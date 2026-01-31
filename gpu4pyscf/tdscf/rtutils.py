@@ -24,6 +24,7 @@ class Field:
             vec = np.zeros(3)
             if len(polarization) == 1:
                 vec[d_idx] = 1.0
+            # Circular polarization, polarization={"xy","xz","yz"}
             elif len(polarization) == 2:
                 dirs_list = list(polarization)
                 d_id1 = dirs.get(dirs_list[0])
@@ -35,11 +36,12 @@ class Field:
 
         def _field(t):
             env = E0 * np.exp(-(t - t0)**2 / (2 * sigma**2))
-            osc = np.cos(freq * t + phase) if freq > 0 else 1.0
-            osc1 = np.sin(freq * t + phase) if freq > 0 else 1.0
+            osc = np.sin(freq * t + phase) if freq > 0 else 1.0
+            osc1 = np.cos(freq * t + phase) if freq > 0 else 1.0
             val = env * osc
             if len(polarization) == 1:
                 return vec * val
+            # Circular polarization
             elif len(polarization) == 2:
                 val1 = env * osc1
                 tvec = np.zeros(3)
@@ -69,18 +71,19 @@ class RTLogger:
         logger = RTLogger('my_output.dat', field_fn=rt.field_fn) # Original usage
         rt.kernel(..., callback=logger)
     '''
-    def __init__(self, filename, field_fn=None, isCs=True,overwrite=True):
+    def __init__(self, filename, occfilename, field_fn=None, isCs=True,overwrite=True):
         self.filename = filename
         self.field_fn = field_fn
-        self.occfilename = "mo_occ.dat"
+        self.occfilename = occfilename
+        self.isCs=isCs
         mode = 'w' if overwrite else 'a'
         
         # Initialize file with header
-        header = "# Time (au) | Energy (Ha)  | Field X | Field Y | Field Z "
+        header = "# Time (au) | Energy Total (Ha)  | E_nuc (Ha) | E_coul (Ha) | E_core (Ha) | E_xc (Ha) | E_field (Ha) | Field X | Field Y | Field Z "
         if self.field_fn is not None:
-            header += " mu X | mu Y | mu Z"
+            header += " | mu X | mu Y | mu Z"
         if not isCs:
-            header += " mu_alpha X | mu_alpha Y | mu_alpha Z | mu_beta X | mu_beta Y | mu_beta Z "
+            header += " | mu_alpha X | mu_alpha Y | mu_alpha Z | mu_beta X | mu_beta Y | mu_beta Z "
         
         with open(self.filename, mode) as f:
             f.write(header + "\n")
@@ -89,13 +92,20 @@ class RTLogger:
         '''The actual callback function.'''
         # Extract latest values
         energy = results['energy'][-1]
+        energy_nuc = results['energy_nuc'][-1]
+        energy_core = results['energy_core'][-1]
+        energy_coul = results['energy_coul'][-1]
+        energy_xc = results['energy_xc'][-1]
+        energy_field = results['energy_field'][-1]
+
         dip = results['dip'][-1] # [dx, dy, dz] 
                 # Add field if available
         if self.field_fn is not None:
             efield = self.field_fn(t)
-            line = f"{t:12.6f} {energy:18.10f} {efield[0]:14.8f} {efield[1]:14.8f} {efield[2]:14.8f}"
+            line = f"{t:12.6f} {energy:18.10f} {energy_nuc:18.10f} {energy_coul:18.10f} {energy_core:18.10f} {energy_xc:18.10f} {energy_field:18.10f} {efield[0]:14.8f} {efield[1]:14.8f} {efield[2]:14.8f}"
 
         # Format strings
+        #if self.isCs:
         line += f" {dip[0]:14.8f} {dip[1]:14.8f} {dip[2]:14.8f}"
         
         # Add spin-resolved dipoles if available
@@ -105,12 +115,12 @@ class RTLogger:
             line += f" {dipa[0]:14.8f} {dipa[1]:14.8f} {dipa[2]:14.8f} {dipb[0]:14.8f} {dipb[1]:14.8f} {dipb[2]:14.8f}"
         
         # MO Occupation numbers
-        if 'occ' in results and len(results['occ']) > 0:
-            occs = results['occ_alpha'][-1]
+        if 'occ' in results and self.isCs > 0:
+            occs = results['occ'][-1]
             occ_str = " ".join([f"{x:14.8f}" for x in occs])
             with open(self.occfilename,'a') as f:
                 f.write(f"{t:12.6f} {occ_str} \n")
-        if 'occ_alpha' in results and len(results['occ_alpha']) > 0:
+        if 'occ_alpha' in results and not self.isCs:
             occs_a = results['occ_alpha'][-1]
             occs_b = results['occ_beta'][-1]
             occ_a_str = " ".join([f"{x:14.8f}" for x in occs_a])
@@ -126,11 +136,12 @@ class CubeVisualizer:
     '''
     Callback for generating Cube files at specified intervals.
     '''
-    def __init__(self, mol, interval=100, prefix='density'):
+    def __init__(self, mol, interval=100, prefix='density',margin=4.0):
         self.mol = mol
         self.interval = interval
         self.prefix = prefix
         self.step = 0
+        self.margin=4.0
 
     def __call__(self, t, dm, results):
         self.step += 1
@@ -138,10 +149,10 @@ class CubeVisualizer:
             fname = f"{self.prefix}_t{t:.2f}.cube"
             print(f"Writing cube: {fname}")
             dm_cpu = cupy.asnumpy(dm)
-            cubegen.density(self.mol, fname, dm_cpu)
+            cubegen.density(self.mol, fname, dm_cpu,self.margin)
 
 
-def write_transition_density_cube(td_obj, state_id, filename):
+def write_transition_density_cube(td_obj, state_id, filename, margin):
     '''
     Generates a cube file for the transition density of a specific excited state
     from a Linear Response TDDFT calculation.

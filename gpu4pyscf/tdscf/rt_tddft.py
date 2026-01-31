@@ -6,7 +6,7 @@ from gpu4pyscf.dft import rks, uks
 from gpu4pyscf.scf import hf, uhf
 
 class RTTDDFT(lib.StreamObject):
-    def __init__(self, ks):
+    def __init__(self, ks, basis='OAO'):
         self.ks = ks
         self.mol = ks.mol
         self.verbose = ks.verbose
@@ -18,22 +18,34 @@ class RTTDDFT(lib.StreamObject):
         # Disable dynamic grid pruning to prevent energy noise during propagation
         self.ks.small_rho_cutoff = 0
         
-        # Precompute orthogonalization matrices (Lowdin symmetric orthogonalization)
-        # S = U s U.T
-        # X = S^(-1/2) = U s^(-1/2) U.T
-        # X_inv = S^(1/2) = U s^(1/2) U.T
+        # Precompute transformation matrices
         s = cupy.asarray(ks.get_ovlp())
-        e, v = cupy.linalg.eigh(s)
         
-        # Filter small eigenvalues for stability
-        mask = e > 1e-15
-        e = e[mask]
-        v = v[:, mask]
+        if basis.upper() == 'OAO':
+            # Lowdin symmetric orthogonalization
+            e, v = cupy.linalg.eigh(s)
+            mask = e > 1e-15
+            e = e[mask]
+            v = v[:, mask]
+            self.x_mat = v @ cupy.diag(e**(-0.5)) @ v.T
+            self.x_inv = v @ cupy.diag(e**(0.5)) @ v.T
+            
+        elif basis.upper() == 'MO':
+            # Canonical MO basis
+            c = cupy.asarray(ks.mo_coeff)
+            self.x_mat = c
+            
+            # X_inv = C^dag S
+            if self.is_uks:
+                # C is (2, N, N), S is (N, N) -> (2, N, N)
+                self.x_inv = cupy.einsum('sji,jk->sik', c.conj(), s)
+            else:
+                self.x_inv = c.conj().T @ s
+        else:
+            raise ValueError(f"Unknown basis: {basis}")
         
-        self.x_mat = v @ cupy.diag(e**(-0.5)) @ v.T
-        self.x_inv = v @ cupy.diag(e**(0.5)) @ v.T
-        
-        # Purification parameter
+        # Propagation & Stability parameters
+        self.purify_interval = None 
         self.mu_spin = 'total' # 'total', 'alpha', 'beta'
         self.record_occ = False # Track MO populations
         
@@ -77,13 +89,21 @@ class RTTDDFT(lib.StreamObject):
         # Ensure dm0 is on GPU and complex
         dm_ao = cupy.asarray(dm0).astype(cupy.complex128)
         
-        # Transform DM to Orthogonal Basis: P_orth = X_inv * P_ao * X_inv.T (since X_inv is symmetric S^(1/2))
-        # P_orth = S^(1/2) P S^(1/2)
+        # Transform DM to Propagator Basis (OAO or MO)
         if self.is_uks:
-            # dm_ao is (2, N, N)
-            dm_orth = self.x_inv @ dm_ao @ self.x_inv.T
+            # dm_ao: (2, N, N)
+            # x_inv: (2, N, N) [if MO] or (N, N) [if OAO]
+            
+            if self.x_inv.ndim == 3:
+                # Batched transformation (MO basis case)
+                # P_orth = X_inv @ P_ao @ X_inv^dag
+                dm_orth = self.x_inv @ dm_ao @ self.x_inv.conj().swapaxes(-1, -2)
+            else:
+                # Broadcast transformation (OAO basis case)
+                dm_orth = self.x_inv @ dm_ao @ self.x_inv.conj().T
         else:
-            dm_orth = self.x_inv @ dm_ao @ self.x_inv.T
+            # RKS: (N, N)
+            dm_orth = self.x_inv @ dm_ao @ self.x_inv.conj().T
             
         # Precompute projection matrices for Population Analysis
         if self.record_occ:
@@ -112,6 +132,7 @@ class RTTDDFT(lib.StreamObject):
         
         # Precompute dipole integrals for field interaction
         # mu = - <phi|r|phi>
+        # Use (0,0,0) as origin to match NWChem default
         with self.mol.with_common_orig((0,0,0)):
             ints_mu = cupy.asarray(self.mol.intor('int1e_r'))
         
@@ -120,7 +141,13 @@ class RTTDDFT(lib.StreamObject):
         results = {
             'times': [],
             'dip': [],
-            'energy': []
+            'energy': [],
+            'energy_nuc': [],
+            'energy_core': [],
+            'energy_coul': [],
+            'energy_xc': [],
+            'energy_field': [],
+            'field': []
         }
         if self.is_uks:
             results['dip_alpha'] = []
@@ -153,7 +180,7 @@ class RTTDDFT(lib.StreamObject):
                     dm_orth = self._apply_mcweeny(dm_orth)
 
                 if propagator == 'magnus_step':
-                    # Magnus 2nd Order / MMUT (Gauss-Legendre 2)
+                    # Magnus 2nd Order / MMUT (Gauss-Legendre 2) - Single Step
                     
                     # 1. Predictor: Estimate F(t+dt/2)
                     # Use current density P_ao(t) to build F_ao(t)
@@ -186,6 +213,91 @@ class RTTDDFT(lib.StreamObject):
                         dm_orth = u_full @ dm_orth @ u_full.conj().swapaxes(-1, -2)
                     else:
                         dm_orth = u_full @ dm_orth @ u_full.conj().T
+
+                elif propagator == 'magnus_iter':
+                    # Iterative Magnus 2nd Order (Self-Consistent Midpoint)
+                    # Converges F(t+dt/2) to ensure P(t+dt/2) is consistent.
+                    
+                    max_iter = 200 #15
+                    threshold = 1e-8 #1e-7
+                    
+                    # Initial Guess for P(t+dt/2): Use P(t)
+                    dm_orth_mid = dm_orth.copy()
+                    
+                    f_orth_mid = None
+                    
+                    for i_iter in range(max_iter):
+                        dm_prev = dm_orth_mid
+                        
+                        # Build F(t+dt/2) using current guess of P(t+dt/2)
+                        dm_ao_mid = self.to_ao(dm_orth_mid)
+                        f_ao_mid = self.get_fock(dm_ao_mid, hcore, ints_mu, t_now + dt/2, c_k)
+                        f_orth_mid = self.to_orth_fock(f_ao_mid)
+                        
+                        # Propagate P(t) -> P(t+dt/2) using this F
+                        # U_half = exp(-i * F * dt/2)
+                        u_half = self.compute_propagator(f_orth_mid, dt/2)
+                        
+                        if self.is_uks:
+                            dm_orth_mid = u_half @ dm_orth @ u_half.conj().swapaxes(-1, -2)
+                        else:
+                            dm_orth_mid = u_half @ dm_orth @ u_half.conj().T
+                            
+                        # Check convergence
+                        diff = cupy.linalg.norm(dm_orth_mid - dm_prev)
+                        if diff < threshold:
+                            break
+                    
+                    # Final Propagation P(t) -> P(t+dt) using converged F(t+dt/2)
+                    # U_full = exp(-i * F * dt)
+                    u_full = self.compute_propagator(f_orth_mid, dt)
+                    
+                    if self.is_uks:
+                        dm_orth = u_full @ dm_orth @ u_full.conj().swapaxes(-1, -2)
+                    else:
+                        dm_orth = u_full @ dm_orth @ u_full.conj().T
+
+                elif propagator == 'magnus_interpol':
+                    # NWChem-style Iterative Interpolation
+                    # F(t+dt/2) = 0.5 * (F(t) + F(t+dt))
+                    
+                    max_iter = 15
+                    threshold = 1e-7
+                    
+                    # Need F(t)
+                    dm_ao = self.to_ao(dm_orth)
+                    f_ao_t = self.get_fock(dm_ao, hcore, ints_mu, t_now, c_k)
+                    
+                    # Initial Guess for P(t+dt): Use P(t)
+                    dm_orth_next = dm_orth.copy()
+                    
+                    for i_iter in range(max_iter):
+                        dm_prev_iter = dm_orth_next
+                        
+                        # Build F(t+dt)
+                        dm_ao_next = self.to_ao(dm_orth_next)
+                        f_ao_next = self.get_fock(dm_ao_next, hcore, ints_mu, t_now + dt, c_k)
+                        
+                        # Interpolate F(t+dt/2)
+                        f_ao_mid = 0.5 * (f_ao_t + f_ao_next)
+                        f_orth_mid = self.to_orth_fock(f_ao_mid)
+                        
+                        # Propagate P(t) -> P(t+dt)
+                        # U = exp(-i * F_mid * dt)
+                        u_full = self.compute_propagator(f_orth_mid, dt)
+                        
+                        if self.is_uks:
+                            dm_orth_next = u_full @ dm_orth @ u_full.conj().swapaxes(-1, -2)
+                        else:
+                            dm_orth_next = u_full @ dm_orth @ u_full.conj().T
+                        
+                        # Check convergence
+                        diff = cupy.linalg.norm(dm_orth_next - dm_prev_iter)
+                        if diff < threshold:
+                            break
+                    
+                    # Update State
+                    dm_orth = dm_orth_next
                 
                 else:
                     raise ValueError(f"Unknown propagator: {propagator}")
@@ -212,23 +324,32 @@ class RTTDDFT(lib.StreamObject):
         return results
 
     def to_ao(self, dm_orth):
-        '''Transform Orthogonal Density -> AO Density: P_ao = X * P_orth * X.T'''
-        # P_ao = S^(-1/2) P_orth S^(-1/2)
+        '''Transform Orthogonal Density -> AO Density: P_ao = X * P_orth * X^dag'''
         if self.is_uks:
-            # dm_orth is (2, N, N), x_mat is (N, N)
-            # i, j, k, l are spatial AO indices. s is spin.
-            return cupy.einsum('ij,sjk,kl->sil', self.x_mat, dm_orth, self.x_mat.T)
+            if self.x_mat.ndim == 3:
+                # MO Basis: X is (2, N, N)
+                # P_ao[s] = X[s] @ P_orth[s] @ X[s]^dag
+                return self.x_mat @ dm_orth @ self.x_mat.conj().swapaxes(-1, -2)
+            else:
+                # OAO Basis: X is (N, N)
+                # P_ao[s] = X @ P_orth[s] @ X^dag
+                return cupy.einsum('ij,sjk,kl->sil', self.x_mat, dm_orth, self.x_mat.conj().T)
         else:
-            return self.x_mat @ dm_orth @ self.x_mat.T
+            return self.x_mat @ dm_orth @ self.x_mat.conj().T
 
     def to_orth_fock(self, f_ao):
-        '''Transform AO Fock -> Orthogonal Fock: F_orth = X.T * F_ao * X'''
-        # F_orth = S^(-1/2) F_ao S^(-1/2)
+        '''Transform AO Fock -> Orthogonal Fock: F_orth = X^dag * F_ao * X'''
         if self.is_uks:
-            # f_ao is (2, N, N)
-            return cupy.einsum('ij,sjk,kl->sil', self.x_mat.T, f_ao, self.x_mat)
+            if self.x_mat.ndim == 3:
+                # MO Basis: X is (2, N, N)
+                # F_orth[s] = X[s]^dag @ F_ao[s] @ X[s]
+                return self.x_mat.conj().swapaxes(-1, -2) @ f_ao @ self.x_mat
+            else:
+                # OAO Basis: X is (N, N)
+                # F_orth[s] = X^dag @ F_ao[s] @ X
+                return cupy.einsum('ij,sjk,kl->sil', self.x_mat.conj().T, f_ao, self.x_mat)
         else:
-            return self.x_mat.T @ f_ao @ self.x_mat
+            return self.x_mat.conj().T @ f_ao @ self.x_mat
 
     def _apply_mcweeny(self, dm):
         '''McWeeny purification: P = 3P^2 - 2P^3'''
@@ -250,21 +371,29 @@ class RTTDDFT(lib.StreamObject):
         dm_re = dm.real.copy() 
         
         # Get Veff (J + Vxc - c_k * K_re)
+        # In gpu4pyscf, get_veff(dm_re) returns the full potential including real exchange.
         v_eff_re = self.ks.get_veff(self.mol, dm_re)
+        
+        if self.is_uks:
+            diff = cupy.linalg.norm(v_eff_re[0] - v_eff_re[1])
+            #print(f"DEBUG: V_eff Alpha-Beta Diff: {diff}")
         
         fock = (hcore + v_eff_re).astype(cupy.complex128)
         
         if c_k != 0.0:
-            if hasattr(v_eff_re, 'vk'):
-                vk_re = v_eff_re.vk
-                fock += vk_re
+            # v_eff_re already contains - c_k * K[dm_re].
+            # We need to add the imaginary exchange: - i * c_k * K[dm.imag]
             
-            # Compute full complex K
-            # Split into Real and Imaginary parts because CUDA kernels expect real DMs
-            vk_real = self.ks.get_k(self.mol, dm.real)
-            vk_imag = self.ks.get_k(self.mol, dm.imag)
-            vk_tot = vk_real + 1j * vk_imag
-            fock -= c_k * vk_tot
+            # Imaginary part of DM is Anti-Symmetric.
+            if self.is_uks:
+                vk_imag_a = self.ks.get_k(self.mol, dm.imag[0], hermi=0)
+                vk_imag_b = self.ks.get_k(self.mol, dm.imag[1], hermi=0)
+                vk_imag = cupy.stack([vk_imag_a, vk_imag_b])
+            else:
+                vk_imag = self.ks.get_k(self.mol, dm.imag, hermi=0)
+            
+            # Subtract i * c_k * K_im
+            fock -= 1j * c_k * vk_imag
             
         # Field interaction: - mu . E(t) = + r . E(t) (since mu = -r)
         if self.field_fn is not None:
@@ -323,30 +452,25 @@ class RTTDDFT(lib.StreamObject):
         charge_center = np.einsum('z,zr->r', charges, coords) / charges.sum()
         
         with mol.with_common_orig(charge_center):
+            ints = mol.intor('int1e_r')  # (3, nao, nao)
+            # Nuclear dipole relative to charge center (AU)
+            dip_nuc = np.einsum('z,zx->x', charges, coords - charge_center)
+
             if self.is_uks:
-                # Individual spin electronic dipoles
-                # PySCF dip_moment adds nuclear contribution.
-                # To get resolved spins, we calculate electronic part manually or call carefully.
-                # Total Dipole = Elec_Alpha + Elec_Beta + Nuc
-                
-                # Full total dipole (incl nuclear)
-                dip_tot = self.ks.dip_moment(mol, dm_cpu, verbose=0)
-                
-                # Electronic part only
-                from pyscf import scf
-                ints = mol.intor('int1e_r')
+                # Electronic dipoles per spin (AU)
                 dip_elec_a = -np.einsum('xij,ji->x', ints, dm_cpu[0].real)
                 dip_elec_b = -np.einsum('xij,ji->x', ints, dm_cpu[1].real)
-                # Nuclear part
-                dip_nuc = dip_tot - (dip_elec_a + dip_elec_b)
-                
-                # Resolved dipoles (partition nuclear part 50/50)
+
+                # Total dipole (AU)
+                dip_tot = dip_nuc + dip_elec_a + dip_elec_b
+
+                # Resolved dipoles: partition nuclear part 50/50
                 dip_a = dip_elec_a + 0.5 * dip_nuc
                 dip_b = dip_elec_b + 0.5 * dip_nuc
-                
+
                 results['dip_alpha'].append(dip_a)
                 results['dip_beta'].append(dip_b)
-                
+
                 if self.mu_spin == 'alpha':
                     results['dip'].append(dip_a)
                 elif self.mu_spin == 'beta':
@@ -355,8 +479,9 @@ class RTTDDFT(lib.StreamObject):
                     results['dip'].append(dip_tot)
             else:
                 # RKS
-                dip = self.ks.dip_moment(mol, dm_cpu, verbose=0)
-                results['dip'].append(dip.real)
+                dip_elec = -np.einsum('xij,ji->x', ints, dm_cpu.real)
+                dip_tot = dip_nuc + dip_elec
+                results['dip'].append(dip_tot)
         
         # Energy
         # E = Tr(h P) + 1/2 Tr(P (J - c K) P) + Exc
@@ -392,27 +517,49 @@ class RTTDDFT(lib.StreamObject):
             omega, alpha, hyb = ni.rsh_and_hybrid_coeff(self.ks.xc, spin=self.mol.spin)
             c_k = hyb if self.is_uks else 0.5 * hyb
             
-            # Remove real exchange from E_tot
-            # Energy contrib was -0.5 * Tr(dm_re * veff.vk)
-            if self.is_uks:
-                e_ex_re = -0.5 * cupy.einsum('sij,sji->', dm_re, veff.vk).real
-            else:
-                e_ex_re = -0.5 * cupy.einsum('ij,ji->', dm_re, veff.vk).real
-            e_tot -= e_ex_re
-            
-            # Add complex exchange
-            # E_ex_tot = -0.5 * c_k * Tr(dm * K_tot)
-            vk_real = self.ks.get_k(self.mol, dm.real)
-            vk_imag = self.ks.get_k(self.mol, dm.imag)
-            k_tot = vk_real + 1j * vk_imag
+            # veff.exc already contains the real exchange energy contribution.
+            # We need to add the contribution from the imaginary density part to Exc.
+            # E_ex_tot = -0.5 * c_k * Tr(P * K_complex)
+            #          = -0.5 * c_k * Tr((Pre + i Pim) * (Kre + i Kim))
+            #          = -0.5 * c_k * Tr(Pre Kre - Pim Kim + i (Pre Kim + Pim Kre))
+            # Real part: -0.5 * c_k * [ Tr(Pre Kre) - Tr(Pim Kim) ]
             
             if self.is_uks:
-                e_ex_tot = -0.5 * c_k * cupy.einsum('sij,sji->', dm, k_tot).real
+                vk_imag_a = self.ks.get_k(self.mol, dm.imag[0], hermi=0)
+                vk_imag_b = self.ks.get_k(self.mol, dm.imag[1], hermi=0)
+                vk_imag = cupy.stack([vk_imag_a, vk_imag_b])
             else:
-                e_ex_tot = -0.5 * c_k * cupy.einsum('ij,ji->', dm, k_tot).real
-            e_tot += e_ex_tot
+                vk_imag = self.ks.get_k(self.mol, dm.imag, hermi=0)
+            
+            # The imaginary density term contribution to the real energy:
+            # -0.5 * c_k * (- Tr(Pim * Kim)) = +0.5 * c_k * Tr(Pim * Kim)
+            if self.is_uks:
+                e_ex_im = 0.5 * c_k * cupy.einsum('sij,sji->', dm.imag, vk_imag).real
+            else:
+                e_ex_im = 0.5 * c_k * cupy.einsum('ij,ji->', dm.imag, vk_imag).real
+            
+            e_tot += e_ex_im
+            
+            # Update Exc to include imaginary corrections
+            exc = exc + e_ex_im
 
         results['energy'].append(float(e_tot.real))
+        results['energy_nuc'].append(float(self.ks.energy_nuc()))
+        results['energy_core'].append(float(e1))
+        results['energy_coul'].append(float(ecoul))
+        results['energy_xc'].append(float(exc))
+        
+        # Field Energy: - mu . E
+        # dip in Debye -> convert back to au: 1 au = 2.5417462 Debye
+        if self.field_fn is not None:
+            efield = np.array(self.field_fn(t))
+            dip_au = np.array(results['dip'][-1]) / 2.5417462
+            e_field = -np.dot(dip_au, efield)
+            results['energy_field'].append(float(e_field))
+            results['field'].append(efield)
+        else:
+            results['energy_field'].append(0.0)
+            results['field'].append(np.zeros(3))
         
         # MO Populations
         if self.record_occ:

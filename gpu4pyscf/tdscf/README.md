@@ -12,6 +12,7 @@ The `rt_tddft` module in `gpu4pyscf` provides a GPU-accelerated implementation o
 *   **Numerical Stability:** Includes options for **McWeeny Purification** to maintain density matrix idempotency.
 *   **External Fields:** Flexible interface for defining arbitrary time-dependent electric field vectors.
 *   **Real-Time Analysis:** Callback interface for extracting properties (dipoles, energy, etc.) on-the-fly.
+*   **Restart System:** Supports periodic checkpointing and resuming from saved states.
 
 ## Usage
 
@@ -42,9 +43,23 @@ rt = RTTDDFT(ks)
 
 # Optional: Set purification interval (e.g., every 10 steps)
 rt.purify_interval = 10
+
+# Optional: Set checkpointing for long runs
+rt.checkpoint_interval = 100
+rt.checkpoint_file = 'rt_restart.npz'
 ```
 
-### 3. Define External Field (Optional)
+### 3. Restarting a Calculation
+
+If a simulation was interrupted, you can resume from the last saved checkpoint.
+
+```python
+rt = RTTDDFT(ks)
+rt.restart_from = 'rt_restart.npz'
+rt.kernel(times=times)
+```
+
+### 4. Define External Field (Optional)
 
 You can define a time-dependent electric field function `field_fn(t)` that returns a vector `[Ex, Ey, Ez]` (in atomic units).
 
@@ -66,7 +81,7 @@ def laser_pulse(t):
 rt.field_fn = laser_pulse
 ```
 
-### 4. Run Propagation
+### 5. Run Propagation
 
 Use the `kernel` method to propagate the density.
 
@@ -86,7 +101,7 @@ print("Final Energy:", results['energy'][-1])
 print("Final Dipole:", results['dip'][-1])
 ```
 
-### 5. Visualization and Analysis
+### 6. Visualization and Analysis
 
 #### Real-Time Properties (Callback)
 Use a callback to save data (e.g., dipoles, occupations) to a file or generate Cube files.
@@ -138,6 +153,9 @@ See **`examples/49-tddft_transition_density_cube.py`** for a complete example.
 *   `purify_interval`: `int`. Step interval for McWeeny purification. Default is `None`.
 *   `mu_spin`: `str`. For UKS, controls the main `results['dip']` output. Options: `'total'` (default), `'alpha'`, `'beta'`.
 *   `record_occ`: `bool`. If `True`, tracks MO occupation numbers in `results['occ']` (RKS) or `results['occ_alpha']`/`results['occ_beta']` (UKS).
+*   `checkpoint_interval`: `int`. Save density matrix every N steps.
+*   `checkpoint_file`: `str`. File to save checkpoint data.
+*   `restart_from`: `str`. File to load for restarting a calculation.
 
 **Methods:**
 
