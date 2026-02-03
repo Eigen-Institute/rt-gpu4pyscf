@@ -1,0 +1,37 @@
+{
+  "calcName": "7hl_xz_rt",
+  "molecule": {
+    "atom": "7hl_opt.xyz",
+    "basis": "3-21g",
+    "charge": -1,
+    "spin": 1,
+    "verbose": 4
+  },
+  "theory": {
+    "xc": "pbe0",
+    "shell":"open",
+    "initial guess":"7hl_geom.chk"
+  },
+    "property": {
+    "analyze":true,
+    "scf summary":true
+  },
+  "rttddft": {
+    "target":4,
+    "tddft file":"tddft.out",
+    "dt": 0.2,
+    "tmax": 1100,
+    "output":"rt_data.7hl_xz.dat",
+    "propagator": "magnus_interpol",
+    "field": {
+      "type":"gaussian",
+      "E0": 0.0001,
+      "t0": 293.3,
+      "sigma": 64.8,
+      "freq": "target",
+      "phase": 0,
+      "polarization": "xz",
+      "hand":"right"
+    }
+  }
+}

@@ -1,13 +1,85 @@
 import numpy as np
 import cupy
 from pyscf.tools import cubegen
+import re 
 
+#--------------------------------------------------------------
+#
+#   def parse_tddft_output: Parse tddft data from provided
+#                           output file. 
+#                           Returns: dict states[int][float 'dipole']
+#
+#--------------------------------------------------------------
+
+def parse_tddft_output(filename):
+    states = {}
+    with open(filename, 'r') as f:
+        content = f.read()
+    
+    # Parse Energies
+    # Excited State   1:      0.41936 eV
+    energy_pattern = re.compile(r"Excited State\s+(\d+):\s+([\d\.]+)\s+eV")
+    for match in energy_pattern.finditer(content):
+        idx = int(match.group(1))
+        energy = float(match.group(2))
+        if idx not in states: states[idx] = {}
+        states[idx]['energy_ev'] = energy
+
+    # Parse Dipoles
+    # state          X           Y           Z
+    #   1        -0.3062      0.1006     -0.2375
+    dipole_section = re.search(r"\*\* Transition electric dipole moments \(AU\) \*\*(.*?)(\*\*|$)", content, re.DOTALL)
+    if dipole_section:
+        dip_lines = dipole_section.group(1).strip().split('\n')
+        for line in dip_lines:
+            parts = line.strip().split()
+            if len(parts) >= 4 and parts[0].isdigit():
+                idx = int(parts[0])
+                try:
+                    dip = [float(parts[1]), float(parts[2]), float(parts[3])]
+                    if idx in states:
+                        states[idx]['dipole'] = dip
+                except ValueError:
+                    continue
+    return states
+
+#--------------------------------------------------------------
+#
+#   class Field - electric field helper
+#
+#--------------------------------------------------------------
 class Field:
+    
+    '''
+    Print field parameters
+    '''
+    def printField(fieldType=None,E0=None,t0=None,sigma=None,freq=None,phase=0,polarization=None, hand=None) :
+        print("")
+        print(f'****    External Field Parameter:      ****')
+        if E0 is not None:
+            print(f'    Maximum Amplitude, E0 =     {E0}')
+        if freq > 0:
+            print(f'    Frequency (Ha) =            {freq:.6f}')
+        if fieldType is not None:
+            print(f'    Envelope Type =             {fieldType}')
+        if t0 is not None:
+            print(f'    Temporal Center (au) =      {t0}')
+        if sigma is not None:
+            print(f'    Temporal Width(au) =        {sigma}')
+        if phase is not None:
+            print(f'    Initial Phase (radians) =   {phase}')
+        if polarization is not None:
+            print(f'    Polarization Direction =    {polarization}')
+        if hand is not None:
+            print(f'    Polarization Chirality =    {hand}')
+        print("")
+
+
     '''
     Helper class to generate common electric field functions for RT-TDDFT.
     '''
     @staticmethod
-    def gaussian_pulse(E0=0.01, t0=10.0, sigma=1.0, freq=0.0, phase=0.0, polarization='z'):
+    def gaussian_pulse(E0=0.01, t0=10.0, sigma=1.0, freq=0.0, phase=0.0, polarization='z',hand=None):
         '''
         Creates a Gaussian envelope pulse.
         Args:
@@ -16,9 +88,10 @@ class Field:
             sigma (float): Width (standard deviation) (au).
             freq (float): Carrier frequency (au). Default 0.0 (DC pulse).
             phase (float): Phase of carrier (radians).
-            polarization (str or list): 'x', 'y', 'z' or [dx, dy, dz].
+            polarization (str or list): 'x', 'y', 'z', 'xy', 'yz', 'xz'.
         '''
         dirs = {'x': 0, 'y': 1, 'z': 2}
+        handMap = {'right':1.0,'left':-1.0} #CTC confirm this definition
         if isinstance(polarization, str):
             d_idx = dirs.get(polarization.lower(), 2)
             vec = np.zeros(3)
@@ -30,7 +103,7 @@ class Field:
                 d_id1 = dirs.get(dirs_list[0])
                 d_id2 = dirs.get(dirs_list[1])
                 vec[d_id1] = 1.0
-                vec[d_id2] = 1.0
+                vec[d_id2] = 1.0*handMap[hand.lower()]
         else:
             vec = np.array(polarization) / np.linalg.norm(polarization)
 
@@ -39,6 +112,7 @@ class Field:
             osc = np.sin(freq * t + phase) if freq > 0 else 1.0
             osc1 = np.cos(freq * t + phase) if freq > 0 else 1.0
             val = env * osc
+            # Linear polarization
             if len(polarization) == 1:
                 return vec * val
             # Circular polarization
@@ -50,6 +124,45 @@ class Field:
                 return vec * tvec
         return _field
 
+    @staticmethod
+    def cw_function(E0=0.001, freq=0.01, phase=0.0, polarization='z', hand=None):
+        '''Creates a CW sinusoidal field '''
+        dirs = {'x': 0, 'y': 1, 'z': 2}
+        d_idx = dirs.get(polarization.lower(), 2)
+        handMap = {'right':1.0,'left':-1.0} #CTC confirm this definition
+        if isinstance(polarization, str):
+            d_idx = dirs.get(polarization.lower(), 2)
+            vec = np.zeros(3)
+            if len(polarization) == 1:
+                vec[d_idx] = 1.0
+            # Circular polarization, polarization={"xy","xz","yz"}
+            elif len(polarization) == 2:
+                dirs_list = list(polarization)
+                d_id1 = dirs.get(dirs_list[0])
+                d_id2 = dirs.get(dirs_list[1])
+                vec[d_id1] = 1.0
+                vec[d_id2] = 1.0*handMap[hand.lower()]
+        else:
+            vec = np.array(polarization) / np.linalg.norm(polarization)
+
+        def _field(t):
+            env = E0
+            osc = np.sin(freq * t + phase) if freq > 0 else 1.0
+            osc1 = np.cos(freq * t + phase) if freq > 0 else 1.0
+            val = env * osc
+            # Linear polarization
+            if len(polarization) == 1:
+                return vec * val
+            # Circular polarization
+            elif len(polarization) == 2:
+                val1 = env * osc1
+                tvec = np.zeros(3)
+                tvec[d_id1] = val
+                tvec[d_id2] = val1
+                return vec * tvec
+        return _field
+
+       
     @staticmethod
     def step_function(E0=0.01, t_start=0.0, polarization='z'):
         '''Creates a step function field (constant after t_start).'''
@@ -136,20 +249,37 @@ class CubeVisualizer:
     '''
     Callback for generating Cube files at specified intervals.
     '''
-    def __init__(self, mol, interval=100, prefix='density',margin=4.0):
+    def __init__(self, mol, interval=100, prefix='density',margin=4.0, treference=None):
         self.mol = mol
         self.interval = interval
         self.prefix = prefix
         self.step = 0
         self.margin=4.0
+        self.treference = treference
+        self.dm_ref = None
 
     def __call__(self, t, dm, results):
+        # Capture reference density if at the target time
+        if self.treference is not None and self.dm_ref is None:
+            if abs(t - self.treference) < 1e-5:
+                print(f"CubeVisualizer: Capturing reference density at t={t}")
+                self.dm_ref = dm.copy()
+
         self.step += 1
         if self.step % self.interval == 0:
-            fname = f"{self.prefix}_t{t:.2f}.cube"
-            print(f"Writing cube: {fname}")
-            dm_cpu = cupy.asnumpy(dm)
-            cubegen.density(self.mol, fname, dm_cpu,self.margin)
+            if self.dm_ref is not None:
+                # Write Difference Density
+                fname = f"diff_{self.prefix}_t{t:.2f}.cube"
+                print(f"Writing difference cube: {fname}")
+                dm_to_write = dm - self.dm_ref
+            else:
+                # Write Full Density
+                fname = f"{self.prefix}_t{t:.2f}.cube"
+                print(f"Writing cube: {fname}")
+                dm_to_write = dm
+
+            dm_cpu = cupy.asnumpy(dm_to_write)
+            cubegen.density(self.mol, fname, dm_cpu, self.margin)
 
 
 def write_transition_density_cube(td_obj, state_id, filename, margin):
