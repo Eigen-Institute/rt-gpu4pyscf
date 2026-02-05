@@ -1,7 +1,99 @@
 import numpy as np
 import cupy
 from pyscf.tools import cubegen
-import re 
+import re, json
+
+#--------------------------------------------------------------
+#
+# Define MultiCallback wrapper
+#
+#--------------------------------------------------------------
+
+class MultiCallback:
+    def __init__(self, callbacks):
+        self.callbacks = callbacks
+    def __call__(self, t, dm, results):
+        for cb in self.callbacks:
+            cb(t, dm, results)
+
+#--------------------------------------------------------------
+#
+# Parse JSON input. Returns array of dicts. 
+#   Array elements: 
+#   [0] - theory_data
+#   [1] - mol_data
+#   [2] - properties
+#   [3] - rttddft_data
+#   [4] - field_data
+#   [5] - viz_data
+#   [6] - names
+#
+#--------------------------------------------------------------
+
+def parseInputJson(filename):
+    opts = []
+    with open(filename, 'r') as f:
+        input_data = json.load(f)
+
+    print('')
+    print("*"*100)
+    print("Reading calculation input from:"+filename)
+    print("")
+    print(input_data)
+    print("*"*100)
+
+    # Parse main level inputs
+    theory_data = input_data.get('theory', {})
+    rttddft_data = input_data.get('rttddft', {})
+    field_data = rttddft_data.get('field', {})
+    properties = input_data.get('property', {})
+    viz_data = rttddft_data.get('visualization')
+    mol_data = input_data.get('molecule', {})
+
+    # Name of the calculation
+    calcName = input_data.get('calcName', 'rttddft_calc')
+    calcName = calcName.replace(" ","_").lower()
+    
+    opts.append(theory_data)
+    opts.append(mol_data)
+    opts.append(properties)
+    opts.append(rttddft_data)
+    opts.append(field_data)
+    opts.append(viz_data)
+    opts.append({"name":calcName})
+        
+    return opts
+
+def getTargetStateFreq(params,target_state=1):
+    tddft_file = params[3]['tddft file']
+    freq = params[4]['freq']
+    polarization = params[4]['polarization']
+    if tddft_file:
+        print(f"\nParsing TDDFT output from {tddft_file} for target state {target_state}...")
+        parsed_states = parse_tddft_output(tddft_file)
+        if target_state in parsed_states:
+            state_info = parsed_states[target_state]
+            
+            # Auto-set Frequency (eV -> Ha) unless overridden in JSON
+            if 'freq' not in params[4] or type(freq) is str:
+                freq_ev = state_info['energy_ev']
+                freq = freq_ev / 27.211386
+                print(f"  Auto-setting freq to {freq:.6f} Ha ({freq_ev} eV)")
+            
+            # Auto-set Polarization unless overridden
+            if 'polarization' not in params[4]:
+                dip = state_info.get('dipole', [0,0,0])
+                abs_dip = [abs(d) for d in dip]
+                max_idx = abs_dip.index(max(abs_dip))
+                polarization = ['x', 'y', 'z'][max_idx]
+                print(f"  Auto-setting polarization to '{polarization}' (Dipole: {dip})")
+        else:
+            print(f"  Warning: State {target_state} not found in {tddft_file}.")
+    else:
+        print("  Warning: 'target' specified but 'tddft file' is missing.")
+
+    return freq, polarization
+
 
 #--------------------------------------------------------------
 #
@@ -249,37 +341,66 @@ class CubeVisualizer:
     '''
     Callback for generating Cube files at specified intervals.
     '''
-    def __init__(self, mol, interval=100, prefix='density',margin=4.0, treference=None):
+    def __init__(self, mol, interval=100, prefix='density', margin=4.0, treference=None, spin='total'):
         self.mol = mol
         self.interval = interval
         self.prefix = prefix
         self.step = 0
-        self.margin=4.0
+        self.margin = margin
         self.treference = treference
         self.dm_ref = None
+        self.spin = spin.lower()
 
     def __call__(self, t, dm, results):
+        # Extract the desired spin component
+        if dm.ndim == 3: # UKS
+            if self.spin == 'alpha':
+                dm_selected = dm[0]
+            elif self.spin == 'beta':
+                dm_selected = dm[1]
+            elif self.spin == 'both':
+                dm_selected = dm[0]
+                dm_selected2 = dm[1]
+            else: # total
+                dm_selected = dm[0] + dm[1]
+        else: # RKS
+            dm_selected = dm
+
         # Capture reference density if at the target time
         if self.treference is not None and self.dm_ref is None:
             if abs(t - self.treference) < 1e-5:
-                print(f"CubeVisualizer: Capturing reference density at t={t}")
-                self.dm_ref = dm.copy()
+                print(f"CubeVisualizer: Capturing {self.spin} reference density at t={t}")
+                self.dm_ref = dm_selected.copy()
+                if self.spin == "both":
+                    self.dm_refBeta = dm_selected2.copy()
 
         self.step += 1
         if self.step % self.interval == 0:
             if self.dm_ref is not None:
                 # Write Difference Density
-                fname = f"diff_{self.prefix}_t{t:.2f}.cube"
-                print(f"Writing difference cube: {fname}")
-                dm_to_write = dm - self.dm_ref
+                if not self.spin == "both":
+                    fname = f"density_subgs.{self.prefix}.{self.spin}.{self.step:07d}.cube"
+                    print(f"Writing {self.spin} difference cube: {fname}")
+                else:
+                    fname = f"density_subgs.{self.prefix}.alpha.{self.step:07d}.cube"
+                    print(f"Writing alpha difference cube: {fname}")
+                    fname_beta = f"density_subgs.{self.prefix}.beta.{self.step:07d}.cube"
+                    print(f"Writing beta difference cube: {fname_beta}")
+                    dm_to_write2 = dm_selected2 - self.dm_refBeta
+                    dm_cpu = cupy.asnumpy(dm_to_write2)
+                    cubegen.density(self.mol, fname_beta, dm_cpu, margin=self.margin)
+                
+                dm_to_write = dm_selected - self.dm_ref
+
             else:
                 # Write Full Density
-                fname = f"{self.prefix}_t{t:.2f}.cube"
-                print(f"Writing cube: {fname}")
-                dm_to_write = dm
+                fname = f"{self.prefix}_{self.spin}_t{t:.2f}.cube"
+                print(f"Writing {self.spin} cube: {fname}")
+                dm_to_write = dm_selected
 
             dm_cpu = cupy.asnumpy(dm_to_write)
-            cubegen.density(self.mol, fname, dm_cpu, self.margin)
+            cubegen.density(self.mol, fname, dm_cpu, margin=self.margin)
+
 
 
 def write_transition_density_cube(td_obj, state_id, filename, margin):
