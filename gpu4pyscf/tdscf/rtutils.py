@@ -81,7 +81,7 @@ def getTargetStateFreq(params,target_state=1):
                 print(f"  Auto-setting freq to {freq:.6f} Ha ({freq_ev} eV)")
             
             # Auto-set Polarization unless overridden
-            if 'polarization' not in params[4]:
+            if 'polarization' not in params[4] or params[4]['polarization'] in ['target','auto']:
                 dip = state_info.get('dipole', [0,0,0])
                 abs_dip = [abs(d) for d in dip]
                 max_idx = abs_dip.index(max(abs_dip))
