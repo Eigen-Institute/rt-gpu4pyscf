@@ -145,12 +145,13 @@ class Field:
     '''
     Print field parameters
     '''
+    @staticmethod
     def printField(fieldType=None,E0=None,t0=None,sigma=None,freq=None,phase=0,polarization=None, hand=None) :
         print("")
         print(f'****    External Field Parameter:      ****')
         if E0 is not None:
             print(f'    Maximum Amplitude, E0 =     {E0}')
-        if freq > 0:
+        if freq is not None and freq > 0:
             print(f'    Frequency (Ha) =            {freq:.6f}')
         if fieldType is not None:
             print(f'    Envelope Type =             {fieldType}')
@@ -161,7 +162,12 @@ class Field:
         if phase is not None:
             print(f'    Initial Phase (radians) =   {phase}')
         if polarization is not None:
-            print(f'    Polarization Direction =    {polarization}')
+            if isinstance(polarization, dict):
+                theta = polarization.get('theta', 0.0)
+                phi = polarization.get('phi', 0.0)
+                print(f'    Polarization Direction =    Theta={theta}, Phi={phi}')
+            else:
+                print(f'    Polarization Direction =    {polarization}')
         if hand is not None:
             print(f'    Polarization Chirality =    {hand}')
         print("")
@@ -180,35 +186,46 @@ class Field:
             sigma (float): Width (standard deviation) (au).
             freq (float): Carrier frequency (au). Default 0.0 (DC pulse).
             phase (float): Phase of carrier (radians).
-            polarization (str or list): 'x', 'y', 'z', 'xy', 'yz', 'xz'.
+            polarization (str, list or dict): 'x', 'y', 'z', 'xy', 'yz', 'xz' or {'theta': th, 'phi': ph}.
         '''
         dirs = {'x': 0, 'y': 1, 'z': 2}
         handMap = {'right':1.0,'left':-1.0} #CTC confirm this definition
+        is_circular = False
         if isinstance(polarization, str):
-            d_idx = dirs.get(polarization.lower(), 2)
-            vec = np.zeros(3)
             if len(polarization) == 1:
+                d_idx = dirs.get(polarization.lower(), 2)
+                vec = np.zeros(3)
                 vec[d_idx] = 1.0
             # Circular polarization, polarization={"xy","xz","yz"}
             elif len(polarization) == 2:
+                is_circular = True
                 dirs_list = list(polarization)
                 d_id1 = dirs.get(dirs_list[0])
                 d_id2 = dirs.get(dirs_list[1])
+                vec = np.zeros(3)
                 vec[d_id1] = 1.0
                 vec[d_id2] = 1.0*handMap[hand.lower()]
+        elif isinstance(polarization, dict):
+            theta = polarization.get('theta', 0.0)
+            phi = polarization.get('phi', 0.0)
+            vec = np.array([
+                np.sin(theta) * np.cos(phi),
+                np.sin(theta) * np.sin(phi),
+                np.cos(theta)
+            ])
         else:
             vec = np.array(polarization) / np.linalg.norm(polarization)
 
         def _field(t):
             env = E0 * np.exp(-(t - t0)**2 / (2 * sigma**2))
             osc = np.sin(freq * t + phase) if freq > 0 else 1.0
-            osc1 = np.cos(freq * t + phase) if freq > 0 else 1.0
             val = env * osc
             # Linear polarization
-            if len(polarization) == 1:
+            if not is_circular:
                 return vec * val
             # Circular polarization
-            elif len(polarization) == 2:
+            else:
+                osc1 = np.cos(freq * t + phase) if freq > 0 else 1.0
                 val1 = env * osc1
                 tvec = np.zeros(3)
                 tvec[d_id1] = val
@@ -217,36 +234,46 @@ class Field:
         return _field
 
     @staticmethod
-    def cw_function(E0=0.001, freq=0.01, phase=0.0, polarization='z', hand=None):
+    def cw_field(E0=0.001, freq=0.01, phase=0.0, polarization='z', hand=None):
         '''Creates a CW sinusoidal field '''
         dirs = {'x': 0, 'y': 1, 'z': 2}
-        d_idx = dirs.get(polarization.lower(), 2)
         handMap = {'right':1.0,'left':-1.0} #CTC confirm this definition
+        is_circular = False
         if isinstance(polarization, str):
-            d_idx = dirs.get(polarization.lower(), 2)
-            vec = np.zeros(3)
             if len(polarization) == 1:
+                d_idx = dirs.get(polarization.lower(), 2)
+                vec = np.zeros(3)
                 vec[d_idx] = 1.0
             # Circular polarization, polarization={"xy","xz","yz"}
             elif len(polarization) == 2:
+                is_circular = True
                 dirs_list = list(polarization)
                 d_id1 = dirs.get(dirs_list[0])
                 d_id2 = dirs.get(dirs_list[1])
+                vec = np.zeros(3)
                 vec[d_id1] = 1.0
                 vec[d_id2] = 1.0*handMap[hand.lower()]
+        elif isinstance(polarization, dict):
+            theta = polarization.get('theta', 0.0)
+            phi = polarization.get('phi', 0.0)
+            vec = np.array([
+                np.sin(theta) * np.cos(phi),
+                np.sin(theta) * np.sin(phi),
+                np.cos(theta)
+            ])
         else:
             vec = np.array(polarization) / np.linalg.norm(polarization)
 
         def _field(t):
             env = E0
             osc = np.sin(freq * t + phase) if freq > 0 else 1.0
-            osc1 = np.cos(freq * t + phase) if freq > 0 else 1.0
             val = env * osc
             # Linear polarization
-            if len(polarization) == 1:
+            if not is_circular:
                 return vec * val
             # Circular polarization
-            elif len(polarization) == 2:
+            else:
+                osc1 = np.cos(freq * t + phase) if freq > 0 else 1.0
                 val1 = env * osc1
                 tvec = np.zeros(3)
                 tvec[d_id1] = val
@@ -259,13 +286,26 @@ class Field:
     def step_function(E0=0.01, t_start=0.0, polarization='z'):
         '''Creates a step function field (constant after t_start).'''
         dirs = {'x': 0, 'y': 1, 'z': 2}
-        d_idx = dirs.get(polarization.lower(), 2)
+        if isinstance(polarization, str):
+            d_idx = dirs.get(polarization.lower(), 2)
+            vec = np.zeros(3)
+            vec[d_idx] = 1.0
+        elif isinstance(polarization, dict):
+            theta = polarization.get('theta', 0.0)
+            phi = polarization.get('phi', 0.0)
+            vec = np.array([
+                np.sin(theta) * np.cos(phi),
+                np.sin(theta) * np.sin(phi),
+                np.cos(theta)
+            ])
+        else:
+            vec = np.array(polarization) / np.linalg.norm(polarization)
         
         def _field(t):
-            res = [0.0, 0.0, 0.0]
             if t >= t_start:
-                res[d_idx] = E0
-            return res
+                return vec * E0
+            else:
+                return np.zeros(3)
         return _field
 
 
