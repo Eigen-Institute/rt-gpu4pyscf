@@ -61,12 +61,38 @@ rt.kernel(times=times)
 
 ### 4. Define External Field (Optional)
 
-You can define a time-dependent electric field function `field_fn(t)` that returns a vector `[Ex, Ey, Ez]` (in atomic units).
+You can define a time-dependent electric field function `field_fn(t)` that returns a vector `[Ex, Ey, Ez]` (in atomic units). 
+
+#### Using the `Field` Helper
+The `rtutils` module provides a `Field` class to generate common pulse shapes.
+
+```python
+from gpu4pyscf.tdscf import rtutils as rtu
+
+# 1. Linear Polarization along an axis
+field_fn = rtu.Field.gaussian_pulse(E0=0.01, t0=10.0, sigma=1.0, freq=0.5, polarization='z')
+
+# 2. Linear Polarization with arbitrary angles (Theta, Phi in radians)
+# Theta: angle from Z-axis, Phi: angle from X-axis in XY plane
+pol_angles = {'theta': 1.5708, 'phi': 0.7854} # 45 degrees in XY plane
+field_fn = rtu.Field.gaussian_pulse(E0=0.01, t0=10.0, sigma=1.0, freq=0.5, polarization=pol_angles)
+
+# 3. Circular Polarization ('xy', 'yz', 'xz')
+field_fn = rtu.Field.gaussian_pulse(E0=0.01, t0=10.0, sigma=1.0, freq=0.5, polarization='xy', hand='right')
+
+# 4. Continuous Wave (CW) field
+field_fn = rtu.Field.cw_field(E0=0.001, freq=0.05, polarization='x')
+
+rt.field_fn = field_fn
+```
+
+#### Custom Field Function
+Alternatively, you can provide a custom function:
 
 ```python
 import numpy as np
 
-# Example: Gaussian Pulse in Z-direction
+# Example: Custom Gaussian Pulse in Z-direction
 def laser_pulse(t):
     E0 = 0.01      # Field strength (au)
     t0 = 10.0      # Center time (au)

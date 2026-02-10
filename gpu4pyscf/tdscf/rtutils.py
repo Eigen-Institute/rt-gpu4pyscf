@@ -83,10 +83,16 @@ def getTargetStateFreq(params,target_state=1):
             # Auto-set Polarization unless overridden
             if 'polarization' not in params[4] or params[4]['polarization'] in ['target','auto']:
                 dip = state_info.get('dipole', [0,0,0])
-                abs_dip = [abs(d) for d in dip]
-                max_idx = abs_dip.index(max(abs_dip))
-                polarization = ['x', 'y', 'z'][max_idx]
-                print(f"  Auto-setting polarization to '{polarization}' (Dipole: {dip})")
+                dx, dy, dz = dip
+                norm = np.sqrt(dx**2 + dy**2 + dz**2)
+                if norm > 1e-8:
+                    theta = np.arccos(dz / norm)
+                    phi = np.arctan2(dy, dx)
+                    polarization = {'theta': float(theta), 'phi': float(phi)}
+                    print(f"  Auto-setting polarization to transition dipole direction: Theta={theta:.6f}, Phi={phi:.6f} (Dipole: {dip})")
+                else:
+                    polarization = 'z'
+                    print(f"  Warning: Transition dipole is zero for state {target_state}. Falling back to 'z' polarization.")
         else:
             print(f"  Warning: State {target_state} not found in {tddft_file}.")
     else:

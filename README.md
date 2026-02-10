@@ -1,3 +1,5 @@
+### Real-Time TDDFT module is in gpu4pyscf/tdscf/rt_tddft.py
+
 GPU plugin for PySCF
 ====================
 ![nightly](https://github.com/pyscf/gpu4pyscf/actions/workflows/nightly_build.yml/badge.svg)
