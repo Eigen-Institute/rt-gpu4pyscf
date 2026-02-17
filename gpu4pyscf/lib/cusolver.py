@@ -16,13 +16,28 @@
 import numpy as np
 import cupy
 import ctypes
+import os
 from ctypes.util import find_library
 from cupy_backends.cuda.libs import cusolver
 from cupy_backends.cuda.libs import cublas
 from cupy.cuda import device
 
-libcusolver = find_library('cusolver')
-libcusolver = ctypes.CDLL(libcusolver)
+def _load_library(name):
+    path = find_library(name)
+    if path:
+        try:
+            return ctypes.CDLL(path)
+        except OSError:
+            pass
+    # Try common names if find_library fails
+    for libname in [f'lib{name}.so', f'lib{name}.so.12', f'lib{name}.so.11']:
+        try:
+            return ctypes.CDLL(libname)
+        except OSError:
+            continue
+    return None
+
+libcusolver = _load_library('cusolver')
 
 # workspace size (lwork) provided by the cusolver*_bufferSize is an 32-bit
 # integer. For arrays above this dimension, the workspace size would overflow.

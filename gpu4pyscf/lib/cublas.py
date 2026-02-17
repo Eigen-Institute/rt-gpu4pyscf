@@ -1,25 +1,36 @@
-# Copyright 2021-2024 The PySCF Developers. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-
 import ctypes
+import os
 from cupy.cuda import device
 from cupy_backends.cuda.libs import cublas #NOQA
 
-libcublas = ctypes.CDLL('libcublas.so')
+def _load_library(name):
+    try:
+        return ctypes.CDLL(name)
+    except OSError:
+        # Try searching in common library paths or nvidia packages
+        return None
 
-# This needs to be moved into functions, and lazy evaluate
-_handle = device.get_cublas_handle() #NOQA
+libcublas = _load_library('libcublas.so')
 
-# NOTE: add modified culbas function here
+# Lazy handle initialization
+_handle_cache = {}
+
+def get_handle():
+    dev_id = device.get_device_id()
+    if dev_id not in _handle_cache:
+        # Explicitly initialize the handle for this device
+        _handle_cache[dev_id] = device.get_cublas_handle()
+    return _handle_cache[dev_id]
+
+# Initializing for device 0 at import time can sometimes help "warm up" the cuBLAS context
+# for the process, which can avoid CUBLAS_STATUS_NOT_INITIALIZED in some environments.
+try:
+    get_handle()
+except Exception:
+    pass
+
+# For backward compatibility if anything uses it directly
+def __getattr__(name):
+    if name == '_handle':
+        return get_handle()
+    raise AttributeError(f"module {__name__} has no attribute {name}")

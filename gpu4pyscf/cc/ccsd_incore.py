@@ -192,7 +192,8 @@ def _direct_ovvv_vvvv(mycc, t1, t2):
     x2 = cupy.asarray(x2, order='C')
     Ht2ao = cupy.zeros_like(x2)
     _dgemm = cupy.cuda.cublas.dgemm
-    handle = cupy.cuda.device.get_cublas_handle()
+    from gpu4pyscf.lib import cublas as libcublas
+    handle = libcublas.get_handle()
     N = cupy.cuda.cublas.CUBLAS_OP_N
     T = cupy.cuda.cublas.CUBLAS_OP_T
     one = np.ones(1)

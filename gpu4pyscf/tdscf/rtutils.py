@@ -211,6 +211,13 @@ class Field:
                 vec = np.zeros(3)
                 vec[d_id1] = 1.0
                 vec[d_id2] = 1.0*handMap[hand.lower()]
+        
+        # Align field with target excited state transition dipole
+        # Must provide output from tddft calculation and target state:
+        #    rttddft:{
+        #        target: N,
+        #        tddft file: file.out
+        #    }
         elif isinstance(polarization, dict):
             theta = polarization.get('theta', 0.0)
             phi = polarization.get('phi', 0.0)
