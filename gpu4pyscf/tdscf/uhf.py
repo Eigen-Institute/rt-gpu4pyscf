@@ -30,6 +30,8 @@ from gpu4pyscf.tdscf import rhf as tdhf_gpu
 from gpu4pyscf.dft import KohnShamDFT
 from pyscf import __config__
 
+ANALYZE_THRESHOLD = getattr(__config__, 'tdscf_uhf_analyze_threshold', 0.1)
+
 __all__ = [
     'TDA', 'CIS', 'TDHF', 'TDUHF', 'TDBase'
 ]
@@ -691,6 +693,71 @@ class TDBase(tdhf_gpu.TDBase):
     def get_ab(self, mf=None):
         if mf is None: mf = self._scf
         return get_ab(self, mf)
+
+    def analyze(self, verbose=None):
+        log = logger.new_logger(self, verbose)
+        if log.verbose < logger.INFO:
+            self.to_cpu().analyze(verbose)
+            return self
+
+        from pyscf.data import nist
+        from pyscf import symm
+        from pyscf.scf import uhf_symm
+        # Copy logic from pyscf.tdscf.uhf.analyze
+        tdobj = self.to_cpu()
+        mol = tdobj.mol
+        maska, maskb = tdobj.get_frozen_mask()
+        mo_coeff = (tdobj._scf.mo_coeff[0][:, maska], tdobj._scf.mo_coeff[1][:, maskb])
+        mo_occ = (tdobj._scf.mo_occ[0][maska], tdobj._scf.mo_occ[1][maskb])
+        nocc_a = np.count_nonzero(mo_occ[0] == 1)
+        nocc_b = np.count_nonzero(mo_occ[1] == 1)
+        MO_BASE = getattr(__config__, 'MO_BASE', 1)
+
+        e_ev = np.asarray(tdobj.e) * nist.HARTREE2EV
+        e_wn = np.asarray(tdobj.e) * nist.HARTREE2WAVENUMBER
+        wave_length = 1e7/e_wn
+
+        log.note('\n** Excitation energies and oscillator strengths **')
+
+        if mol.symmetry:
+            orbsyma, orbsymb = uhf_symm.get_orbsym(mol, mo_coeff)
+            x_syma = symm.direct_prod(orbsyma[mo_occ[0]==1], orbsyma[mo_occ[0]==0], mol.groupname)
+            x_symb = symm.direct_prod(orbsymb[mo_occ[1]==1], orbsymb[mo_occ[1]==0], mol.groupname)
+        else:
+            x_syma = None
+
+        f_oscillator = tdobj.oscillator_strength()
+        for i, ei in enumerate(tdobj.e):
+            x, y = tdobj.xy[i]
+            if x_syma is None:
+                log.note('Excited State %3d: %12.5f eV %9.2f nm  f=%.4f',
+                         i+1, e_ev[i], wave_length[i], f_oscillator[i])
+            else:
+                wfnsyma = tdhf_gpu.tdhf_cpu._analyze_wfnsym(tdobj, x_syma, x[0])
+                wfnsymb = tdhf_gpu.tdhf_cpu._analyze_wfnsym(tdobj, x_symb, x[1])
+                if wfnsyma == wfnsymb:
+                    wfnsym = wfnsyma
+                else:
+                    wfnsym = '???'
+                log.note('Excited State %3d: %4s %12.5f eV %9.2f nm  f=%.4f',
+                         i+1, wfnsym, e_ev[i], wave_length[i], f_oscillator[i])
+
+            for o, v in zip(* np.where(abs(x[0]) > ANALYZE_THRESHOLD)):
+                log.info('    %4da -> %4da %12.5f',
+                         o+MO_BASE, v+MO_BASE+nocc_a, x[0][o,v])
+            for o, v in zip(* np.where(abs(x[1]) > ANALYZE_THRESHOLD)):
+                log.info('    %4db -> %4db %12.5f',
+                         o+MO_BASE, v+MO_BASE+nocc_b, x[1][o,v])
+
+        log.info('\n** Transition electric dipole moments (AU) **')
+        log.info('state          X           Y           Z        Dip. S.      Osc.')
+        trans_dip = tdobj.transition_dipole()
+        for i, ei in enumerate(tdobj.e):
+            dip = trans_dip[i]
+            log.info('%3d    %11.4f %11.4f %11.4f %11.4f %11.4f',
+                     i+1, dip[0], dip[1], dip[2], np.dot(dip, dip),
+                     f_oscillator[i])
+        return self
 
     def _contract_multipole(tdobj, ints, hermi=True, xy=None):
         if xy is None: xy = tdobj.xy

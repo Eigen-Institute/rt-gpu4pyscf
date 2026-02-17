@@ -30,6 +30,7 @@ from pyscf import __config__
 REAL_EIG_THRESHOLD = tdhf_cpu.REAL_EIG_THRESHOLD
 #OUTPUT_THRESHOLD = tdhf_cpu.OUTPUT_THRESHOLD
 OUTPUT_THRESHOLD = getattr(__config__, 'tdscf_rhf_get_nto_threshold', 0.3)
+ANALYZE_THRESHOLD = getattr(__config__, 'tdscf_rhf_analyze_threshold', 0.1)
 
 __all__ = [
     'TDA', 'CIS', 'TDHF', 'TDRHF', 'TDBase'
@@ -437,7 +438,82 @@ class TDBase(lib.StreamObject):
     transition_magnetic_quadrupole = tdhf_cpu.transition_magnetic_quadrupole
 
     def analyze(self, verbose=None):
-        self.to_cpu().analyze(verbose)
+        log = logger.new_logger(self, verbose)
+        if log.verbose < logger.INFO:
+            self.to_cpu().analyze(verbose)
+            return self
+
+        from pyscf.data import nist
+        from pyscf import symm
+        from pyscf.scf import hf_symm
+        from pyscf.lib import param
+
+        # Copy logic from pyscf.tdscf.rhf.analyze
+        # but use ANALYZE_THRESHOLD instead of fixed 0.1
+        tdobj = self.to_cpu()
+        mol = tdobj.mol
+        mask = tdobj.get_frozen_mask()
+        mo_coeff = tdobj._scf.mo_coeff[:, mask]
+        mo_occ = tdobj._scf.mo_occ[mask]
+        nocc = np.count_nonzero(mo_occ == 2)
+        MO_BASE = getattr(__config__, 'MO_BASE', 1)
+
+        e_ev = np.asarray(tdobj.e) * nist.HARTREE2EV
+        e_wn = np.asarray(tdobj.e) * nist.HARTREE2WAVENUMBER
+        wave_length = 1e7/e_wn
+
+        if tdobj.singlet:
+            log.note('\n** Singlet excitation energies and oscillator strengths **')
+        else:
+            log.note('\n** Triplet excitation energies and oscillator strengths **')
+
+        if mol.symmetry:
+            orbsym = hf_symm.get_orbsym(mol, mo_coeff)
+            x_sym = symm.direct_prod(orbsym[mo_occ==2], orbsym[mo_occ==0], mol.groupname)
+        else:
+            x_sym = None
+
+        f_oscillator = tdobj.oscillator_strength()
+        for i, ei in enumerate(tdobj.e):
+            x, y = tdobj.xy[i]
+            if x_sym is None:
+                log.note('Excited State %3d: %12.5f eV %9.2f nm  f=%.4f',
+                         i+1, e_ev[i], wave_length[i], f_oscillator[i])
+            else:
+                wfnsym = tdhf_cpu._analyze_wfnsym(tdobj, x_sym, x)
+                log.note('Excited State %3d: %4s %12.5f eV %9.2f nm  f=%.4f',
+                         i+1, wfnsym, e_ev[i], wave_length[i], f_oscillator[i])
+
+            o_idx, v_idx = np.where(abs(x) > ANALYZE_THRESHOLD)
+            for o, v in zip(o_idx, v_idx):
+                log.info('    %4d -> %-4d %12.5f',
+                         o+MO_BASE, v+MO_BASE+nocc, x[o,v])
+
+        log.info('\n** Transition electric dipole moments (AU) **')
+        log.info('state          X           Y           Z        Dip. S.      Osc.')
+        trans_dip = tdobj.transition_dipole()
+        for i, ei in enumerate(tdobj.e):
+            dip = trans_dip[i]
+            log.info('%3d    %11.4f %11.4f %11.4f %11.4f %11.4f',
+                     i+1, dip[0], dip[1], dip[2], np.dot(dip, dip),
+                     f_oscillator[i])
+
+        log.info('\n** Transition velocity dipole moments (imaginary part, AU) **')
+        log.info('state          X           Y           Z        Dip. S.      Osc.')
+        trans_v = tdobj.transition_velocity_dipole()
+        f_v = tdobj.oscillator_strength(gauge='velocity', order=0)
+        for i, ei in enumerate(tdobj.e):
+            v = trans_v[i]
+            log.info('%3d    %11.4f %11.4f %11.4f %11.4f %11.4f',
+                     i+1, v[0], v[1], v[2], np.dot(v, v), f_v[i])
+
+        log.info('\n** Transition magnetic dipole moments (imaginary part, AU) **')
+        log.info('state          X           Y           Z')
+        trans_m = tdobj.transition_magnetic_dipole()
+        for i, ei in enumerate(tdobj.e):
+            m = trans_m[i]
+            log.info('%3d    %11.4f %11.4f %11.4f',
+                     i+1, m[0], m[1], m[2])
         return self
 
     def get_nto(self, state=1, threshold=OUTPUT_THRESHOLD, verbose=None):
