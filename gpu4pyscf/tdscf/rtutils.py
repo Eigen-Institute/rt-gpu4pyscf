@@ -456,12 +456,13 @@ class CubeVisualizer:
 
 
 
-def write_transition_density_cube(td_obj, state_id, filename, margin):
+def write_transition_density_cube(td_obj, state_id, filename, margin=4.0, spin='total'):
     '''
     Generates a cube file for the transition density of a specific excited state
     from a Linear Response TDDFT calculation.
     '''
     mol = td_obj.mol
+    spin = spin.lower()
     
     # Ensure coefficients are on CPU (NumPy) to match TDDFT amplitudes
     mo_coeff = cupy.asnumpy(td_obj._scf.mo_coeff)
@@ -470,7 +471,7 @@ def write_transition_density_cube(td_obj, state_id, filename, margin):
     # Get X and Y amplitudes for the requested state (PySCF returns NumPy arrays)
     x, y = td_obj.xy[state_id]
     
-    print(f"Generating transition density for State {state_id+1}...")
+    print(f"Generating transition density for State {state_id+1} (spin={spin})...")
     
     if td_obj._scf.istype('UHF'):
         # UKS Case
@@ -493,8 +494,19 @@ def write_transition_density_cube(td_obj, state_id, filename, margin):
             dm_trans_s = t_ao + t_ao.T
             dm_trans.append(dm_trans_s)
             
-        # Total transition density
-        dm_trans_tot = np.array(dm_trans[0] + dm_trans[1])
+        if spin == 'alpha':
+            dm_to_write = [dm_trans[0]]
+            filenames = [filename]
+        elif spin == 'beta':
+            dm_to_write = [dm_trans[1]]
+            filenames = [filename]
+        elif spin == 'both':
+            dm_to_write = [dm_trans[0], dm_trans[1]]
+            base_name = filename.replace('.cube', '')
+            filenames = [base_name + '_alpha.cube', base_name + '_beta.cube']
+        else: # total
+            dm_to_write = [dm_trans[0] + dm_trans[1]]
+            filenames = [filename]
         
     else:
         # RKS Case
@@ -506,7 +518,12 @@ def write_transition_density_cube(td_obj, state_id, filename, margin):
         t_ao = c[:, occ_idx] @ t_mo @ c[:, vir_idx].T
         
         dm_trans_tot = t_ao + t_ao.T
+        dm_to_write = [dm_trans_tot]
+        filenames = [filename]
+        if spin != 'total':
+            print(f"Warning: spin={spin} requested for RKS. Dumping total transition density.")
 
-    # Generate Cube
-    cubegen.density(mol, filename, dm_trans_tot,margin=4.0)
-    print(f"Written to {filename}")
+    # Generate Cube(s)
+    for dm, fname in zip(dm_to_write, filenames):
+        cubegen.density(mol, fname, dm, margin=margin)
+        print(f"Written to {fname}")

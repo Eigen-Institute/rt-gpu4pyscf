@@ -30,7 +30,7 @@ from pyscf import __config__
 REAL_EIG_THRESHOLD = tdhf_cpu.REAL_EIG_THRESHOLD
 #OUTPUT_THRESHOLD = tdhf_cpu.OUTPUT_THRESHOLD
 OUTPUT_THRESHOLD = getattr(__config__, 'tdscf_rhf_get_nto_threshold', 0.3)
-ANALYZE_THRESHOLD = getattr(__config__, 'tdscf_rhf_analyze_threshold', 0.1)
+ANALYZE_THRESHOLD = getattr(__config__, 'tdscf_rhf_analyze_threshold', 0.05)
 
 __all__ = [
     'TDA', 'CIS', 'TDHF', 'TDRHF', 'TDBase'

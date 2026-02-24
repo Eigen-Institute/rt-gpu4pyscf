@@ -30,7 +30,7 @@ from gpu4pyscf.tdscf import rhf as tdhf_gpu
 from gpu4pyscf.dft import KohnShamDFT
 from pyscf import __config__
 
-ANALYZE_THRESHOLD = getattr(__config__, 'tdscf_uhf_analyze_threshold', 0.1)
+ANALYZE_THRESHOLD = getattr(__config__, 'tdscf_uhf_analyze_threshold', 0.05)
 
 __all__ = [
     'TDA', 'CIS', 'TDHF', 'TDUHF', 'TDBase'

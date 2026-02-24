@@ -163,11 +163,30 @@ dip_b = results['dip_beta']
 ```
 
 #### Transition Densities (Linear Response TDDFT)
-You can also generate transition density cube files from standard Linear Response TDDFT calculations.
+You can generate transition density cube files from standard Linear Response TDDFT calculations using the `rtutils.write_transition_density_cube` utility.
 
-See **`examples/49-tddft_transition_density_cube.py`** for a complete example.
+For open-shell (UKS) systems, you can dump separate alpha and beta transition densities.
 
-## API Reference
+```python
+from gpu4pyscf.tdscf import rtutils
+
+# 1. Total transition density (alpha + beta)
+rtutils.write_transition_density_cube(td, state_id=0, filename="state1.cube")
+
+# 2. Separate spin components (UKS only)
+rtutils.write_transition_density_cube(td, state_id=0, filename="state1.cube", spin='both')
+# Generates state1_alpha.cube and state1_beta.cube
+
+# 3. Specific component
+rtutils.write_transition_density_cube(td, state_id=0, filename="state1_beta.cube", spin='beta')
+```
+
+### Configuration
+
+Global settings can be adjusted via `pyscf.__config__`:
+
+*   `tdscf_rhf_analyze_threshold`: (Default: 0.1) Minimal amplitude coefficient to print during `td.analyze()`.
+*   `tdscf_uhf_analyze_threshold`: (Default: 0.1) Minimal amplitude coefficient to print for UKS/UHF.
 
 ### `class RTTDDFT(ks)`
 

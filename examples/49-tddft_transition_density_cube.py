@@ -20,11 +20,12 @@ td = tdscf.uks.TDDFT(ks) if ks.istype('UHF') else tdscf.rks.TDDFT(ks)
 td.nstates = 5
 td.kernel()
 
-def write_transition_density_cube(td_obj, state_id, filename):
+def write_transition_density_cube(td_obj, state_id, filename, margin=4.0, spin='total'):
     '''
     Manual construction of transition density matrix and cube generation.
     '''
     mol = td_obj.mol
+    spin = spin.lower()
     
     # Ensure coefficients are on CPU (NumPy) to match TDDFT amplitudes
     mo_coeff = cupy.asnumpy(td_obj._scf.mo_coeff)
@@ -33,6 +34,8 @@ def write_transition_density_cube(td_obj, state_id, filename):
     # Get X and Y amplitudes for the requested state
     # PySCF stores amplitudes as (X, Y) tuples in td.xy
     x, y = td_obj.xy[state_id]
+    
+    print(f"Generating transition density for State {state_id+1} (spin={spin})...")
     
     if td_obj._scf.istype('UHF'):
         # UKS Case
@@ -62,8 +65,19 @@ def write_transition_density_cube(td_obj, state_id, filename):
             dm_trans_s = t_ao + t_ao.T
             dm_trans.append(dm_trans_s)
             
-        # Total transition density (alpha + beta)
-        dm_trans_tot = np.array(dm_trans[0] + dm_trans[1])
+        if spin == 'alpha':
+            dm_to_write = [dm_trans[0]]
+            filenames = [filename]
+        elif spin == 'beta':
+            dm_to_write = [dm_trans[1]]
+            filenames = [filename]
+        elif spin == 'both':
+            dm_to_write = [dm_trans[0], dm_trans[1]]
+            base_name = filename.replace('.cube', '')
+            filenames = [base_name + '_alpha.cube', base_name + '_beta.cube']
+        else: # total
+            dm_to_write = [dm_trans[0] + dm_trans[1]]
+            filenames = [filename]
         
     else:
         # RKS Case
@@ -77,13 +91,26 @@ def write_transition_density_cube(td_obj, state_id, filename):
         
         # Symmetrize for visualization
         dm_trans_tot = t_ao + t_ao.T
+        dm_to_write = [dm_trans_tot]
+        filenames = [filename]
+        if spin != 'total':
+            print(f"Warning: spin={spin} requested for RKS. Dumping total transition density.")
 
-    # Generate Cube
-    print(f"Writing transition density for state {state_id} to {filename}")
-    cubegen.density(mol, filename, dm_trans_tot)
+    # Generate Cube(s)
+    for dm, fname in zip(dm_to_write, filenames):
+        cubegen.density(mol, fname, dm, margin=margin)
+        print(f"Written to {fname}")
 
 # 3. Generate Cube for the first excited state
 # State indices are 0-based
 write_transition_density_cube(td, 0, 'transition_density_s1.cube')
+
+# For UKS calculations, you can dump separate alpha and beta transition densities:
+# 1. Dump both components into separate files:
+# write_transition_density_cube(td, 0, 'transition_density_s1.cube', spin='both')
+# (Generates transition_density_s1_alpha.cube and transition_density_s1_beta.cube)
+
+# 2. Dump only a specific component:
+# write_transition_density_cube(td, 0, 'transition_density_s1_alpha.cube', spin='alpha')
 
 print("Finished.")
