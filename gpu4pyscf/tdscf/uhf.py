@@ -685,6 +685,7 @@ def gen_tda_operation(td, mf, fock_ao=None, wfnsym=None):
 
 
 class TDBase(tdhf_gpu.TDBase):
+    analyze_spin_resolved = True
 
     def gen_response(self, mo_coeff=None, mo_occ=None, hermi=0):
         '''Generate function to compute A x'''
@@ -752,14 +753,27 @@ class TDBase(tdhf_gpu.TDBase):
         log.info('\n** Transition electric dipole moments (AU) **')
         log.info('state          X           Y           Z        Dip. S.      Osc.')
         trans_dip = tdobj.transition_dipole()
+        if self.analyze_spin_resolved:
+            trans_dip_spin = self.transition_dipole_spin()
         for i, ei in enumerate(tdobj.e):
             dip = trans_dip[i]
             log.info('%3d    %11.4f %11.4f %11.4f %11.4f %11.4f',
                      i+1, dip[0], dip[1], dip[2], np.dot(dip, dip),
                      f_oscillator[i])
+            if self.analyze_spin_resolved:
+                dip_a, dip_b = trans_dip_spin[i]
+                log.info('      alpha %11.4f %11.4f %11.4f', dip_a[0], dip_a[1], dip_a[2])
+                log.info('      beta  %11.4f %11.4f %11.4f', dip_b[0], dip_b[1], dip_b[2])
         return self
 
-    def _contract_multipole(tdobj, ints, hermi=True, xy=None):
+    def transition_dipole_spin(self):
+        '''Transition dipole moments for alpha and beta spins'''
+        mol = self.mol
+        with mol.with_common_orig(mol.atom_coords().mean(axis=0)):
+            ints = mol.intor('int1e_r', comp=3)
+        return self._contract_multipole(ints, hermi=True, spin_resolved=True)
+
+    def _contract_multipole(tdobj, ints, hermi=True, xy=None, spin_resolved=False):
         if xy is None: xy = tdobj.xy
         mo_coeff = tdobj._scf.mo_coeff
         mo_occ = tdobj._scf.mo_occ
@@ -775,18 +789,29 @@ class TDBase(tdhf_gpu.TDBase):
 
         ints_a = np.einsum('...pq,pi,qj->...ij', ints, orbo_a.conj(), orbv_a)
         ints_b = np.einsum('...pq,pi,qj->...ij', ints, orbo_b.conj(), orbv_b)
-        pol = [(np.einsum('...ij,ij->...', ints_a, x[0]) +
-                np.einsum('...ij,ij->...', ints_b, x[1])) for x,y in xy]
-        pol = np.array(pol)
+        
+        pol_a = [np.einsum('...ij,ij->...', ints_a, x[0]) for x,y in xy]
+        pol_b = [np.einsum('...ij,ij->...', ints_b, x[1]) for x,y in xy]
+        pol_a = np.array(pol_a)
+        pol_b = np.array(pol_b)
+
         y = xy[0][1]
         if isinstance(y[0], np.ndarray):
-            pol_y = [(np.einsum('...ij,ij->...', ints_a, y[0]) +
-                      np.einsum('...ij,ij->...', ints_b, y[1])) for x,y in xy]
+            pol_ya = [np.einsum('...ij,ij->...', ints_a, y[0]) for x,y in xy]
+            pol_yb = [np.einsum('...ij,ij->...', ints_b, y[1]) for x,y in xy]
+            pol_ya = np.array(pol_ya)
+            pol_yb = np.array(pol_yb)
             if hermi:
-                pol += pol_y
+                pol_a += pol_ya
+                pol_b += pol_yb
             else:  # anti-Hermitian
-                pol -= pol_y
-        return pol
+                pol_a -= pol_ya
+                pol_b -= pol_yb
+        
+        if spin_resolved:
+            return np.stack([pol_a, pol_b], axis=1)
+        else:
+            return pol_a + pol_b
 
 
 class TDA(TDBase):
