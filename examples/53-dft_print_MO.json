@@ -1,0 +1,22 @@
+{
+  "calcName": "anth-m1_tddft",
+  "molecule": {
+    "atom": "anth-m1_opt.xyz",
+    "basis": "def2-svp",
+    "charge": -1,
+    "spin": 1,
+    "symmetry":true,
+    "verbose": 4
+  },
+  "theory": {
+    "xc": "pbe0",
+    "initial guess": "anth-m1.chk",
+    "shell": "open"
+  },
+  "property": {
+    "analyze":false,
+    "scf summary":true,
+    "NTO":false,
+    "MO cube":["58-64"]
+  }
+}

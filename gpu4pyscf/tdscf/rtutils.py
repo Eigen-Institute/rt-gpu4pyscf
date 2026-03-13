@@ -456,7 +456,7 @@ class CubeVisualizer:
 
 
 
-def write_transition_density_cube(td_obj, state_id, filename, margin=4.0, spin='total'):
+def write_transition_density_cube(td_obj, state_id, filename, cube_data={}, spin='total'):
     '''
     Generates a cube file for the transition density of a specific excited state
     from a Linear Response TDDFT calculation.
@@ -525,5 +525,5 @@ def write_transition_density_cube(td_obj, state_id, filename, margin=4.0, spin='
 
     # Generate Cube(s)
     for dm, fname in zip(dm_to_write, filenames):
-        cubegen.density(mol, fname, dm, margin=margin)
+        cubegen.density(mol, fname, dm, resolution=cube_data.get("resolution",None), margin=cube_data.get("margin",4.5))
         print(f"Written to {fname}")
