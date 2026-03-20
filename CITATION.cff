@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+  - family-names: "Chapman"
+    given-names: "Craig T."
+    orcid: "https://orcid.org/0000-0001-5349-5359"
+title: "RT-GPU4PYSCF"
+version: "1.0.0"
+date-released: "2026-1-25"
+url: "https://github.com/Eigen-Institute/rt-gpu4pyscf/blob/master/gpu4pyscf/tdscf/rt_tddft.py"
