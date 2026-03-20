@@ -1,4 +1,6 @@
-### Real-Time TDDFT module is in gpu4pyscf/tdscf/rt_tddft.py
+### Real-Time TDDFT module can be found in gpu4pyscf/tdscf/rt_tddft.py
+### Spin-polarized transition density moments printing in gpu4pyscf/tdscf/uhf.py
+#### All other code is written by the original authors and should be attributed as such
 
 GPU plugin for PySCF
 ====================
