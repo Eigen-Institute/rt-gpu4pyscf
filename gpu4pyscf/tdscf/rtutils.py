@@ -504,6 +504,10 @@ def write_transition_density_cube(td_obj, state_id, filename, cube_data={}, spin
             dm_to_write = [dm_trans[0], dm_trans[1]]
             base_name = filename.replace('.cube', '')
             filenames = [base_name + '_alpha.cube', base_name + '_beta.cube']
+        elif spin == 'all':
+            dm_to_write = [dm_trans[0], dm_trans[1], dm_trans[0] + dm_trans[1]]
+            base_name = filename.replace('.cube', '')
+            filenames = [base_name + '_alpha.cube', base_name + '_beta.cube', filename]
         else: # total
             dm_to_write = [dm_trans[0] + dm_trans[1]]
             filenames = [filename]
