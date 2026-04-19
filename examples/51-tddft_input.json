@@ -10,7 +10,7 @@
   "theory": {
     "xc": "pbe0",
     "initial guess": "test_geom.chk",
-    "shell": "open"
+    "shell": "closed"
   },
   "property": {
     "mulliken":true,

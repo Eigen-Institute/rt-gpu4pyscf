@@ -3,7 +3,7 @@ import cupy
 import sys, time
 import json
 import argparse
-from pyscf import gto
+from pyscf import gto,symm
 from pyscf.tools import cubegen,molden
 from gpu4pyscf import dft,tdscf
 from gpu4pyscf.tdscf.rt_tddft import RTTDDFT
@@ -21,6 +21,7 @@ properties = input_data.get("property", {})
 mol_data = input_data.get('molecule', {})
 theory_data = input_data.get('theory', {})
 tddft_data = input_data.get('tddft', {})
+cube_data = input_data.get('cube', {})
 
 # Print Input Parameters
 print('')
@@ -40,7 +41,8 @@ mol = gto.M(
     basis=mol_data.get('basis', '3-21g'),
     verbose=mol_data.get('verbose', 4),
     charge=mol_data.get('charge', 0),
-    spin=mol_data.get('spin', 0)
+    spin=mol_data.get('spin', 0),
+    symmetry=mol_data.get('symmetry',False)
 )
 
 # Define Theory
@@ -54,12 +56,29 @@ ks.xc = theory_data.get('xc', 'pbe0')
 ks.chkfile=theory_data.get('initial guess',calcName+'.chk')
 ks.init_guess = 'chkfile'
 ks.kernel()
-#isOs=ks.istype('UKS')
-#isCs=ks.istype('RKS')
+
+# Perform Analyze
 if "analyze" in properties and properties["analyze"]:
     ks.analyze()
 if properties["scf summary"]:
     ks.dump_scf_summary()
+
+# Print Symmetry Information
+if mol.symmetry:
+    mo_coeff = ks.mo_coeff
+    if theory_data["shell"].lower() == "open":
+        # For UKS, mo_coeff is (2, nbasis, nmo) or [mo_a, mo_b]
+        mo_a = mo_coeff[0].get() if hasattr(mo_coeff[0], 'get') else mo_coeff[0]
+        mo_b = mo_coeff[1].get() if hasattr(mo_coeff[1], 'get') else mo_coeff[1]
+        irreps_a = symm.label_orb_symm(mol, mol.irrep_name, mol.symm_orb, mo_a)
+        irreps_b = symm.label_orb_symm(mol, mol.irrep_name, mol.symm_orb, mo_b)
+        print("\n   Alpha MO irreps:", irreps_a)
+        print("   Beta  MO irreps:", irreps_b, "\n")
+    else:
+        mo = mo_coeff.get() if hasattr(mo_coeff, 'get') else mo_coeff
+        irreps = symm.label_orb_symm(mol, mol.irrep_name, mol.symm_orb, mo)
+        print("\n   MO irreps:", irreps, "\n")
+
 
 # TDDFT
 if isOs:
@@ -67,15 +86,19 @@ if isOs:
 else:
     td = tdscf.rks.TDDFT(ks)
 
-# Number of Excited States
+# Singlet/Triplet
+spin = tddft_data.get("singlet",True)
+td.singlet = spin
+tdGauge = tddft_data.get("gauge",'velocity')
 
+
+# Number of Excited States
 nstates = tddft_data.get('nstates', 5)
 td.kernel(nstates=nstates)
-
-# Analysis
-if "analyze spin resolved" in tddft_data:
-    td.analyze_spin_resolved = tddft_data["analyze spin resolved"]
 td.analyze()
+f_velocity = td.oscillator_strength(gauge=tdGauge, order=1)
+print(" ***** Transition dipole velocities")
+print(f_velocity)
 
 # NTOs
 if properties["NTO"]:
@@ -109,5 +132,8 @@ if cubeList is not None:
     for i in range(len(cubeList)):
         # Write Excited State Cubes
         state_idx=cubeList[i]-1
-        rtu.write_transition_density_cube(td, state_idx, "tdens-"+str(state_idx+1)+"_"+calcName+".cube",margin=4.0,spin=cubeSpin)
-            
+        if isinstance(cubeSpin,str):
+            rtu.write_transition_density_cube(td, state_idx, "tdens-"+str(state_idx+1)+"_"+calcName+".cube",cube_data,spin=cubeSpin)
+        else:
+            for j in range(len(cubeSpin)):
+                rtu.write_transition_density_cube(td, state_idx, "tdens-"+str(state_idx+1)+"_"+calcName+".cube",cube_data,spin=cubeSpin[j])

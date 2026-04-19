@@ -1,0 +1,42 @@
+{
+  "calcName": "mol rttddft",
+  "molecule": {
+    "atom": "mol.xyz",
+    "basis": "6-31g",
+    "charge": 0,
+    "spin": 0,
+    "verbose": 4
+  },
+  "theory": {
+    "xc": "pbe0",
+    "shell":"open",
+    "initial guess":"mol.chk"
+  },
+    "property": {
+    "analyze":true,
+    "scf summary":true
+  },
+  "rttddft": {
+    "target":1,
+    "tddft file":"mol_tddft.out",
+    "dt": 0.2,
+    "tmax": 1500,
+    "output":"rt_data.mol.dat",
+    "propagator": "magnus_interpol",
+    "basis":"MO",
+    "field": {
+      "type":"gaussian",
+      "E0": 0.0001,
+      "t0": 300,
+      "sigma": 100.0,
+      "freq": "target",
+      "phase": 0,
+      "polarization":"target"
+    },
+    "visualization": {
+      "treference":0.0,
+      "interval": 20,
+      "spin":"both"
+    }
+  }
+}

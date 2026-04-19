@@ -1,18 +1,23 @@
+#
+#   Template script for RT-TDDFT
+#   Use in conjunction with rttddft.json:
+#
+#       python rttddft_json.py -i rttddft.json
+#
+#
 import numpy as np
 import cupy
 import time, sys
-import json
+import json, re
 import argparse
-import re
+import h5py
+from pyscf.lib import H5FileWrap
 from pyscf import gto
 from pyscf.tools import cubegen
 from gpu4pyscf import dft,tdscf
 from gpu4pyscf.tdscf.rt_tddft import RTTDDFT
 from gpu4pyscf.tdscf import rtutils as rtu
-sys.path.append("/home/craig/research/templates/eigen")
-import footer
 startTime=time.time()
-footer.print_footer()
 
 # Parse Command Line Arguments
 parser = argparse.ArgumentParser(description='GPU4PySCF Real-Time TDDFT')
@@ -23,105 +28,77 @@ args = parser.parse_args()
 with open(args.input, 'r') as f:
     input_data = json.load(f)
 
-print('')
-print("*"*100)
-print("Reading calculation input from:"+args.input)
-print("")
-print(input_data)
-print("*"*100)
-
 # Parse main level inputs
 theory_data = input_data.get('theory', {})
 rttddft_data = input_data.get('rttddft', {})
 field_data = rttddft_data.get('field', {})
 properties = input_data.get('property', {})
+viz_data = rttddft_data.get('visualization')
+mol_data = input_data.get('molecule', {})
 
 # Name of the calculation
 calcName = input_data.get('calcName', 'rttddft_calc')
 calcName = calcName.replace(" ","_").lower()
 
+# Define calculation parameters
+params = rtu.parseInputJson(args.input)
+
 # Define Molecule
-mol_data = input_data.get('molecule', {})
 mol = gto.M(
-    atom=mol_data.get('atom', 'opt.xyz'),
-    basis=mol_data.get('basis', '3-21g'),
-    verbose=mol_data.get('verbose', 4),
-    charge=mol_data.get('charge', 0),
-    spin=mol_data.get('spin', 0)
+    atom=params[1]["atom"],
+    basis=params[1]['basis'],
+    verbose=params[1]['verbose'],
+    charge=params[1]['charge'],
+    spin=params[1]['spin']
 )
 
+
 # Define theory
-if theory_data["shell"] == "open":
+if params[0]["shell"] == "open":
     ks = dft.UKS(mol)
     isOs = True
     isCs = False
-elif theory_data["shell"] == "closed":
+elif params[0]["shell"] == "closed":
     ks = dft.RKS(mol)
     isCs = True
     isOs = False
-ks.xc = theory_data.get('xc', 'pbe0')
-ks.chkfile=theory_data.get("initial guess",calcName+'.chk')
-ks.init_guess = 'chkfile'
+ks.xc = params[0]['xc']
+ks.chkfile=params[0]["initial guess"]
+if h5py.is_hdf5(ks.chkfile):
+    ks.init_guess = 'chkfile'
 ks.kernel()
-if properties["analyze"]:
+if "analyze" in params[2] and params[2]["analyze"]:
     ks.analyze()
-if properties['scf summary']:
+if params[2]['scf summary']:
     ks.dump_scf_summary()
+scfTime=time.time()
+print("\n   scf wall time: ",scfTime-startTime," s \n\n")
 
 
 # Define RT-TDDFT simulation
 
-rt = RTTDDFT(ks)
+rt = RTTDDFT(ks,basis=params[3].get('propagation basis','MO'))
 rt.verbose=4
 rt.mu_spin='total'
 rt.record_occ=True
-dt = rttddft_data.get('dt', 0.2)
-tmax = rttddft_data.get('tmax', 1100)
-propagator = rttddft_data.get('propagator', 'magnus_interpol')
+dt = params[3]['dt']
+tmax = params[3]['tmax']
+propagator = params[3].get('propagator', 'magnus_interpol')
 
 ## Define Field Parameters
-fieldType = field_data.get("type","gaussian")
-E0 = field_data.get('E0', 0.01)
-t0 = field_data.get('t0', 150)
-sigma = field_data.get('sigma', 100)
-freq = field_data.get('freq', 0.05)
-phase = field_data.get('phase', 0)
-polarization = field_data.get('polarization', 'x')
-hand = field_data['hand']
+fieldType = params[4].get("type","gaussian")
+E0 = params[4].get('E0', 0.01)
+t0 = params[4].get('t0', 150)
+sigma = params[4].get('sigma', 100)
+freq = params[4].get('freq', 0.05)
+phase = params[4].get('phase', 0)
+polarization = params[4].get('polarization', 'x')
+hand = params[4].get('hand','right')
 
 # Dynamic Target Selection
-target_state = rttddft_data.get('target')
+target_state = params[3].get('target')
 if target_state is not None:
-    tddft_file = rttddft_data.get('tddft file')
-    if tddft_file:
-        print(f"\nParsing TDDFT output from {tddft_file} for target state {target_state}...")
-        parsed_states = rtu.parse_tddft_output(tddft_file)
-        if target_state in parsed_states:
-            state_info = parsed_states[target_state]
-            
-            # Auto-set Frequency (eV -> Ha) unless overridden in JSON
-            if 'freq' not in field_data or type(freq) is str:
-                freq_ev = state_info['energy_ev']
-                freq = freq_ev / 27.211386
-                print(f"  Auto-setting freq to {freq:.6f} Ha ({freq_ev} eV)")
-            
-            # Auto-set Polarization unless overridden
-            if 'polarization' not in field_data or field_data['polarization'] in ['target','auto']:
-                dip = state_info.get('dipole', [0,0,0])
-                dx, dy, dz = dip
-                norm = np.sqrt(dx**2 + dy**2 + dz**2)
-                if norm > 1e-8:
-                    theta = np.arccos(dz / norm)
-                    phi = np.arctan2(dy, dx)
-                    polarization = {'theta': float(theta), 'phi': float(phi)}
-                    print(f"  Auto-setting polarization to transition dipole direction: Theta={theta:.6f}, Phi={phi:.6f} (Dipole: {dip})")
-                else:
-                    polarization = 'z'
-                    print(f"  Warning: Transition dipole is zero for state {target_state}. Falling back to 'z' polarization.")
-        else:
-            print(f"  Warning: State {target_state} not found in {tddft_file}.")
-    else:
-        print("  Warning: 'target' specified but 'tddft file' is missing.")
+    freq, polarization = rtu.getTargetStateFreq(params,target_state)
 
 # Assign field type
 match fieldType.lower():
@@ -133,11 +110,30 @@ match fieldType.lower():
         rtu.Field.printField(fieldType=fieldType,E0=E0,freq=freq,phase=phase,polarization=polarization, hand=hand)
 
 # Output file names
-output_file = rttddft_data.get("output",'rt_data_'+calcName+'.dat')
-mo_file = 'occ_'+calcName+'.dat'
+output_file = params[3].get("output",'rt_data.'+params[6]['name']+'.dat')
+mo_file = 'occ_'+params[6]['name']+'.dat'
 
+# Initialize Callbacks
+callbacks = []
 # Logging callback 
 logger = rtu.RTLogger(output_file,mo_file,rt.field_fn,isCs)
+callbacks.append(logger)
+# 2. Visualization callback
+viz_data = rttddft_data.get('visualization')
+if params[5]:
+    interval = params[5]['interval']
+    treference = params[5]['treference']
+    spin = params[5].get('spin', 'total')
+    visualizer = rtu.CubeVisualizer(mol, interval=interval, prefix=params[6]['name'], treference=treference, spin=spin)
+    callbacks.append(visualizer)
+    if treference is not None:
+        print(f"Visualization enabled ({spin} density). Writing difference cubes relative to t={treference} every {interval} steps.")
+    else:
+        print(f"Visualization enabled ({spin} density). Writing cubes every {interval} steps.")
+
+# Combine
+callback_fn = rtu.MultiCallback(callbacks)
+
 
 # Run Propagation
 times = np.arange(0, tmax, dt) # Short test run
@@ -145,7 +141,7 @@ times = np.arange(0, tmax, dt) # Short test run
 # Start Run
 #rtu.printParams()
 print(f"Starting RT-TDDFT. Data will be written to {output_file}...")
-results = rt.kernel(times=times, dt=dt, propagator=propagator, callback=logger)
+results = rt.kernel(times=times, dt=dt, propagator=propagator, callback=callback_fn)
 
 # Finished
 print("\n\n   Propagation finished.\n")
@@ -157,6 +153,6 @@ print("\n\n   Propagation finished.\n")
 #######################################################
 
 endTime=time.time()
+print("\n   rttddft wall time: ",endTime-scfTime," s \n\n")
 print("\n   wall time: ",endTime-startTime," s \n\n")
-footer.print_footer()
 
