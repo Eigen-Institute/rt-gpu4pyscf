@@ -49,6 +49,7 @@ def parseInputJson(filename):
     properties = input_data.get('property', {})
     viz_data = rttddft_data.get('visualization')
     mol_data = input_data.get('molecule', {})
+    ehrenfest_data = rttddft_data.get('ehrenfest')
 
     # Name of the calculation
     calcName = input_data.get('calcName', 'rttddft_calc')
@@ -61,6 +62,7 @@ def parseInputJson(filename):
     opts.append(field_data)
     opts.append(viz_data)
     opts.append({"name":calcName})
+    opts.append(ehrenfest_data)
         
     return opts
 
@@ -342,6 +344,7 @@ class RTLogger:
             header += " | mu X | mu Y | mu Z"
         if not isCs:
             header += " | mu_alpha X | mu_alpha Y | mu_alpha Z | mu_beta X | mu_beta Y | mu_beta Z "
+            header += " | S^2"
         
         with open(self.filename, mode) as f:
             f.write(header + "\n")
@@ -349,21 +352,28 @@ class RTLogger:
     def __call__(self, t, dm, results):
         '''The actual callback function.'''
         # Extract latest values
-        energy = results['energy'][-1]
-        energy_nuc = results['energy_nuc'][-1]
-        energy_core = results['energy_core'][-1]
-        energy_coul = results['energy_coul'][-1]
-        energy_xc = results['energy_xc'][-1]
-        energy_field = results['energy_field'][-1]
+        energy = results.get('energy', [0])[-1]
+        energy_nuc = results.get('energy_nuc', [0])[-1]
+        energy_core = results.get('energy_core', [0])[-1]
+        energy_coul = results.get('energy_coul', [0])[-1]
+        energy_xc = results.get('energy_xc', [0])[-1]
+        energy_field = results.get('energy_field', [0])[-1]
+        
+        # If Ehrenfest, total energy is elsewhere
+        if 'energy_tot' in results and len(results['energy_tot']) > 0:
+             energy = results['energy_tot'][-1]
 
-        dip = results['dip'][-1] # [dx, dy, dz] 
-                # Add field if available
+        dip = results.get('dip', [[0,0,0]])[-1] # [dx, dy, dz] 
+        # Format strings
+        line = f"{t:12.6f} {energy:18.10f} {energy_nuc:18.10f} {energy_coul:18.10f} {energy_core:18.10f} {energy_xc:18.10f} {energy_field:18.10f}"
+        
+        # Add field if available
         if self.field_fn is not None:
             efield = self.field_fn(t)
-            line = f"{t:12.6f} {energy:18.10f} {energy_nuc:18.10f} {energy_coul:18.10f} {energy_core:18.10f} {energy_xc:18.10f} {energy_field:18.10f} {efield[0]:14.8f} {efield[1]:14.8f} {efield[2]:14.8f}"
+            line += f" {efield[0]:14.8f} {efield[1]:14.8f} {efield[2]:14.8f}"
+        else:
+            line += f" {0.0:14.8f} {0.0:14.8f} {0.0:14.8f}"
 
-        # Format strings
-        #if self.isCs:
         line += f" {dip[0]:14.8f} {dip[1]:14.8f} {dip[2]:14.8f}"
         
         # Add spin-resolved dipoles if available
@@ -371,9 +381,14 @@ class RTLogger:
             dipa = results['dip_alpha'][-1]
             dipb = results['dip_beta'][-1]
             line += f" {dipa[0]:14.8f} {dipa[1]:14.8f} {dipa[2]:14.8f} {dipb[0]:14.8f} {dipb[1]:14.8f} {dipb[2]:14.8f}"
+
+        # Add S^2 if available
+        if 's2' in results and len(results['s2']) > 0:
+            s2 = results['s2'][-1]
+            line += f" {s2:14.8f}"
         
         # MO Occupation numbers
-        if 'occ' in results and self.isCs > 0:
+        if 'occ' in results and self.isCs:
             occs = results['occ'][-1]
             occ_str = " ".join([f"{x:14.8f}" for x in occs])
             with open(self.occfilename,'a') as f:
@@ -388,6 +403,32 @@ class RTLogger:
         
         with open(self.filename, 'a') as f:
             f.write(line + "\n")
+
+
+class EhrenfestLogger:
+    '''
+    Callback for logging Ehrenfest trajectory (coords, velocities, forces).
+    '''
+    def __init__(self, filename, mol, overwrite=True):
+        self.filename = filename
+        self.mol = mol
+        self.symbols = [mol.atom_symbol(i) for i in range(mol.natm)]
+        mode = 'w' if overwrite else 'a'
+        with open(self.filename, mode) as f:
+            f.write("# Time (au) | Atom | X (Bohr) | Y (Bohr) | Z (Bohr) | Vx (au) | Vy (au) | Vz (au) | Fx (au) | Fy (au) | Fz (au)\n")
+
+    def __call__(self, t, dm, results):
+        if 'coords' not in results or len(results['coords']) == 0: return
+        
+        coords = results['coords'][-1]
+        vels = results['velocities'][-1]
+        forces = results['forces'][-1]
+        
+        with open(self.filename, 'a') as f:
+            for i, sym in enumerate(self.symbols):
+                f.write(f"{t:12.6f} {sym:3s} {coords[i,0]:14.8f} {coords[i,1]:14.8f} {coords[i,2]:14.8f} ")
+                f.write(f"{vels[i,0]:14.8f} {vels[i,1]:14.8f} {vels[i,2]:14.8f} ")
+                f.write(f"{forces[i,0]:14.8f} {forces[i,1]:14.8f} {forces[i,2]:14.8f}\n")
 
 
 class CubeVisualizer:
@@ -442,7 +483,7 @@ class CubeVisualizer:
                     dm_to_write2 = dm_selected2 - self.dm_refBeta
                     dm_cpu = cupy.asnumpy(dm_to_write2)
                     cubegen.density(self.mol, fname_beta, dm_cpu, margin=self.margin)
-                
+
                 dm_to_write = dm_selected - self.dm_ref
 
             else:
@@ -455,8 +496,86 @@ class CubeVisualizer:
             cubegen.density(self.mol, fname, dm_cpu, margin=self.margin)
 
 
+class S2Callback:
+    '''
+    Callback for calculating <S^2> during RT-TDDFT for unrestricted systems.
+    '''
+    def __init__(self, mol):
+        self.mol = mol
+        self.s = cupy.asarray(mol.intor('int1e_ovlp'))
+
+    def __call__(self, t, dm, results):
+        if dm.ndim == 3: # UKS
+            dm_a = dm[0].real
+            dm_b = dm[1].real
+
+            # Tr(Pa S Pb S)
+            tr_psps = cupy.einsum('ij,jk,kl,li->', dm_a, self.s, dm_b, self.s).real
+
+            # N_alpha, N_beta
+            na = cupy.einsum('ij,ji->', dm_a, self.s).real
+            nb = cupy.einsum('ij,ji->', dm_b, self.s).real
+
+            sz = (na - nb) / 2
+            s2 = sz * (sz + 1) + nb - tr_psps
+
+            if 's2' not in results: results['s2'] = []
+            results['s2'].append(float(s2))
+
+
+class ForceLogger:
+    '''
+    Callback for calculating and logging Ehrenfest forces during standard RT-TDDFT.
+    '''
+    def __init__(self, filename, rt_obj, overwrite=True):
+        self.filename = filename
+        self.rt_obj = rt_obj
+        self.mol = rt_obj.mol
+        self.symbols = [self.mol.atom_symbol(i) for i in range(self.mol.natm)]
+        mode = 'w' if overwrite else 'a'
+        with open(self.filename, mode) as f:
+            f.write("# Time (au) | Atom | Fx (au) | Fy (au) | Fz (au)\n")
+
+    def __call__(self, t, dm, results):
+        from gpu4pyscf.tdscf.ehrenfest import get_ehrenfest_force
+        forces = get_ehrenfest_force(self.rt_obj, dm, t)
+        
+        # Store in results for other callbacks if needed
+        if 'forces' not in results: results['forces'] = []
+        results['forces'].append(forces)
+        
+        with open(self.filename, 'a') as f:
+            for i, sym in enumerate(self.symbols):
+                f.write(f"{t:12.6f} {sym:3s} {forces[i,0]:14.8f} {forces[i,1]:14.8f} {forces[i,2]:14.8f}\n")
+
+
+class XYZLogger:
+    '''
+    Callback for logging Ehrenfest/QMD trajectory to a standard .xyz file.
+    '''
+    def __init__(self, filename, mol, overwrite=True):
+        self.filename = filename
+        self.mol = mol
+        self.symbols = [mol.atom_symbol(i) for i in range(mol.natm)]
+        self.mode = 'w' if overwrite else 'a'
+
+    def __call__(self, t, dm, results):
+        if 'coords' not in results or len(results['coords']) == 0: return
+        
+        coords = results['coords'][-1] # Bohr
+        coords_ang = coords * 0.52917721092 # Convert to Angstrom for XYZ
+        
+        with open(self.filename, 'a' if self.mode == 'a' else self.mode) as f:
+            f.write(f"{len(self.symbols)}\n")
+            f.write(f"Time: {t:12.6f} au\n")
+            for i, sym in enumerate(self.symbols):
+                f.write(f"{sym:2s} {coords_ang[i,0]:14.8f} {coords_ang[i,1]:14.8f} {coords_ang[i,2]:14.8f}\n")
+        # Ensure next steps append
+        self.mode = 'a'
+
 
 def write_transition_density_cube(td_obj, state_id, filename, cube_data={}, spin='total'):
+
     '''
     Generates a cube file for the transition density of a specific excited state
     from a Linear Response TDDFT calculation.

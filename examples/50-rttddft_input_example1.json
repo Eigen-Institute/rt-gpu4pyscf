@@ -19,6 +19,7 @@
   "rttddft": {
     "target":4,
     "tddft file":"mol_tddft.out",
+    "S2": true,
     "dt": 0.2,
     "tmax": 1500,
     "output":"rt_data.mol_xz.dat",
@@ -32,6 +33,10 @@
       "phase": 0,
       "polarization": "xz",
       "hand":"right"
+    },
+    "ehrenfest": {
+      "enabled": false,
+      "velocities": "input.xyz"
     }
   }
 }
