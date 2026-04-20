@@ -97,13 +97,15 @@ elif ehrenfest_enabled:
     dt = params[3].get('dt', 0.05)
     tmax = params[3].get('tmax', 1.0)
     propagator = params[3].get('propagator', 'magnus_interpol')
-    print("Ehrenfest Dynamics enabled.")
+    n_electronic = ehrenfest_data.get('n_electronic', 1)
+    print(f"Ehrenfest Dynamics enabled (n_electronic={n_electronic}).")
 else:
     rt = RTTDDFT(ks,basis=params[3].get('propagation basis','MO'))
     md_data = None
     dt = params[3].get('dt', 0.05)
     tmax = params[3].get('tmax', 1.0)
     propagator = params[3].get('propagator', 'magnus_interpol')
+    n_electronic = 1  # unused for RT-TDDFT (no nuclei moving)
 
 # Configure MD Parameters (Velocities, Thermostats)
 if qmd_enabled or ehrenfest_enabled:
@@ -206,6 +208,10 @@ times = np.arange(0, tmax, dt) # Short test run
 if qmd_enabled:
     print(f"Starting QMD (BOMD). Data will be written to {output_file}...")
     results = rt.kernel(times=times, dt=dt, callback=callback_fn)
+elif ehrenfest_enabled:
+    print(f"Starting Ehrenfest MD. Data will be written to {output_file}...")
+    results = rt.kernel(times=times, dt=dt, propagator=propagator,
+                        callback=callback_fn, n_electronic=n_electronic)
 else:
     print(f"Starting RT-TDDFT. Data will be written to {output_file}...")
     results = rt.kernel(times=times, dt=dt, propagator=propagator, callback=callback_fn)

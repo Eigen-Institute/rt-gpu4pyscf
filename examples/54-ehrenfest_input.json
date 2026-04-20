@@ -1,0 +1,25 @@
+{
+  "calcName": "h2o_ehrenfest_example",
+  "molecule": {
+    "atom": "O 0.000000 0.000000 0.117400; H 0.000000 0.757000 -0.469600; H 0.000000 -0.757000 -0.469600",
+    "basis": "3-21g",
+    "charge": 0,
+    "spin": 0,
+    "verbose": 3
+  },
+  "theory": {
+    "xc": "pbe0",
+    "shell": "closed"
+  },
+  "rttddft": {
+    "dt": 0.05,
+    "tmax": 10.0,
+    "propagation basis": "OAO",
+    "output": "rt_data.dat",
+    "ehrenfest": {
+      "enabled": true,
+      "n_electronic": 1,
+      "velocities": [[0.0, 0.0, 0.0], [0.0, 0.01, 0.0], [0.0, -0.01, 0.0]]
+    }
+  }
+}

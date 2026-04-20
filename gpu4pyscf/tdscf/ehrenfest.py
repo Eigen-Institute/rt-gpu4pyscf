@@ -183,9 +183,21 @@ class BaseMD(RTTDDFT):
 
 class EhrenfestMD(BaseMD):
     '''Ehrenfest Molecular Dynamics implementation.'''
-    def kernel(self, times, dm0=None, dt=0.02, propagator='magnus_interpol', callback=None):
+    def kernel(self, times, dm0=None, dt=0.02, propagator='magnus_interpol',
+               callback=None, n_electronic=1):
+        '''Propagate Ehrenfest dynamics.
+
+        dt: nuclear time step. Verlet uses this size.
+        n_electronic: number of electronic Magnus sub-steps per nuclear step.
+            Electrons advance in steps of dt/n_electronic with geometry linearly
+            interpolated between R(t) and R(t+dt). Forces on nuclei are still
+            only evaluated at the endpoints (standard multi-scale Ehrenfest).
+            n_electronic=1 reproduces the single-scale scheme.
+        '''
         log = logger.new_logger(self, self.verbose)
         mol, mf = self.mol, self.ks
+        if n_electronic < 1:
+            raise ValueError("n_electronic must be >= 1")
         if dm0 is None: dm0 = mf.make_rdm1()
         dm_ao = cupy.asarray(dm0).astype(cupy.complex128)
         # Primary state is the density in the Löwdin-orthogonal basis. When the
@@ -198,53 +210,56 @@ class EhrenfestMD(BaseMD):
 
         coords = mol.atom_coords()
         if self.velocities is None: self.velocities = np.zeros_like(coords)
-        log.info("Computing initial Ehrenfest forces...")
+        log.info(f"Ehrenfest MD: dt={dt}, n_electronic={n_electronic} "
+                 f"(dt_e={dt/n_electronic:.4g}). Computing initial forces...")
         self.forces = get_ehrenfest_force(self, dm_ao, t=0.0)
         results = {'times': [], 'coords': [], 'velocities': [], 'forces': [], 'energy_elec': [], 'energy_tot': []}
         t_now = 0.0
         self._record_md(t_now, dm_ao, coords, results)
         if callback: callback(t_now, dm_ao, results)
+        dt_e = dt / n_electronic
         for t_target in times:
             if t_target <= t_now + 1e-6: continue
             steps = int(np.round((t_target - t_now) / dt))
             for step in range(steps):
-                # ---- Build F_orth(t) at R(t), BEFORE moving nuclei -----------
-                # The time-symmetric Magnus step needs F(t) and F(t+dt) at their
-                # own geometries; averaging AO Focks across geometries is
-                # ill-defined, but averaging orthogonal-basis Focks is smooth
-                # under the same Löwdin sudden-approx that carries dm_orth.
-                f_orth_t = self._build_f_orth(dm_orth, t_now) if \
-                    propagator == 'magnus_interpol' else None
-
-                # Snapshot for non-adiabatic coupling: need X and the mol at
-                # the OLD geometry to form the mixed AO overlap M later.
-                x_mat_old = self.x_mat.copy()
-                mol_old = mol.copy()  # AO basis frozen at R(t); build() already done
-
-                # Predictor: Nuclear Half-step
+                # Predictor: Nuclear Half-step (nuclear-scale dt)
                 accel = self.forces / self.masses[:, None]
                 v_mid = self.velocities + 0.5 * accel * dt
                 r_next = coords + v_mid * dt
 
-                # Update geometry. dm_orth is carried through unchanged.
-                mol.set_geom_(r_next, unit='Bohr')
-                mf.reset(mol)
-                self._update_basis()
+                # Electronic sub-steps at R(τ) linearly interpolated between
+                # R(t) and R(t+dt). For n_electronic=1 this reduces to the
+                # single-step scheme with the move happening before the
+                # electronic step.
+                f_orth_prev = None
+                mol_prev = mol.copy()           # mol at R(τ_{j}) for D_dt
+                x_mat_prev = self.x_mat.copy()  # X at R(τ_{j})
+                if propagator == 'magnus_interpol':
+                    f_orth_prev = self._build_f_orth(dm_orth, t_now)
+                for j in range(n_electronic):
+                    tau_end = (j + 1) / n_electronic
+                    R_tau = coords + tau_end * (r_next - coords)
+                    mol.set_geom_(R_tau, unit='Bohr')
+                    mf.reset(mol)
+                    self._update_basis()
 
-                # Non-adiabatic coupling D_dt ≈ antisym(X_old^T · M · X_new)
-                # where M_{μν} = <χ_μ(R_old) | χ_ν(R_new)>. This term closes the
-                # energy balance for a moving basis; without it the drift is
-                # O(v) per unit time (dt-independent).
-                D_dt = self._compute_D_dt(mol_old, x_mat_old)
+                    D_dt_sub = self._compute_D_dt(mol_prev, x_mat_prev)
 
-                # Electronic Step — state is dm_orth throughout.
-                dm_orth = self._electronic_step(dm_orth, t_now, dt, propagator,
-                                                f_orth_t=f_orth_t, D_dt=D_dt)
+                    t_sub = t_now + j * dt_e
+                    dm_orth = self._electronic_step(
+                        dm_orth, t_sub, dt_e, propagator,
+                        f_orth_t=f_orth_prev, D_dt=D_dt_sub)
 
-                # AO representation at the new geometry for forces & recording.
+                    # Hand off F_orth and basis snapshots to the next sub-step.
+                    if j < n_electronic - 1 and propagator == 'magnus_interpol':
+                        f_orth_prev = self._build_f_orth(dm_orth, t_sub + dt_e)
+                        mol_prev = mol.copy()
+                        x_mat_prev = self.x_mat.copy()
+
+                # AO representation at R(t+dt) for force computation & logging.
                 dm_ao = self.to_ao(dm_orth)
 
-                # New forces at t+dt
+                # New forces at t+dt (nuclear-endpoint only)
                 new_forces = get_ehrenfest_force(self, dm_ao, t=t_now + dt)
                 new_accel = new_forces / self.masses[:, None]
 
