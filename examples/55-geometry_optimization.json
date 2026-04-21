@@ -1,0 +1,23 @@
+{
+  "calcName": "test_geom",
+  "molecule": {
+    "atom": "XXX.xyz",
+    "basis": "3-21g",
+    "charge": 0,
+    "spin": 0,
+    "verbose": 4
+  },
+  "theory": {
+    "xc": "pbe0",
+    "shell":"open",
+    "initial guess":"test.chk"
+  },
+  "geomopt": {
+    "maxsteps": 100,
+    "output_file": "optimized.xyz"
+  },
+  "properties": {
+    "Hessian": true,
+    "vib": true
+  }
+}
