@@ -7,8 +7,6 @@ from pyscf import gto
 from pyscf.tools import cubegen
 from gpu4pyscf import dft,tdscf
 from pyscf.geomopt import geometric_solver
-sys.path.append("/home/craig/research/templates/eigen")
-import footer
 startTime=time.time()
 
 # Parse Command Line Arguments
@@ -123,5 +121,4 @@ if props.get('Hessian', False) or props.get('vib', False):
 
 endTime=time.time()
 print("\n\n     wall time:",str(endTime-startTime)+" s")
-footer.print_footer()
 
