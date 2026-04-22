@@ -574,6 +574,35 @@ class XYZLogger:
         self.mode = 'a'
 
 
+def load_velocities_from_xyz(filename):
+    '''
+    Load velocities from an XYZ-format file.
+    The file should have the same structure as a standard XYZ file, 
+    but with velocity components (Vx, Vy, Vz in au) instead of coordinates.
+    '''
+    with open(filename, 'r') as f:
+        lines = f.readlines()
+    
+    try:
+        natm = int(lines[0].strip())
+    except ValueError:
+        raise ValueError(f"Invalid XYZ format in {filename}: Line 1 must be number of atoms.")
+    
+    velocities = []
+    # Skip header (natm) and comment line
+    for i in range(2, 2 + natm):
+        if i >= len(lines): break
+        parts = lines[i].split()
+        if len(parts) >= 4:
+            # Format: Symbol Vx Vy Vz
+            velocities.append([float(parts[1]), float(parts[2]), float(parts[3])])
+        elif len(parts) == 3:
+            # Format: Vx Vy Vz
+            velocities.append([float(parts[0]), float(parts[1]), float(parts[2])])
+            
+    return np.array(velocities)
+
+
 def write_transition_density_cube(td_obj, state_id, filename, cube_data={}, spin='total'):
 
     '''

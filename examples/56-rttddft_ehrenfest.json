@@ -1,0 +1,44 @@
+{
+  "calcName": "mol_ehrenfest_target",
+  "molecule": {
+    "atom": "mol_opt.xyz",
+    "basis": "3-21g",
+    "charge": -1,
+    "spin": 1,
+    "verbose": 4
+  },
+  "theory": {
+    "xc": "pbe0",
+    "shell":"open",
+    "initial guess":"mol_geom.chk"
+  },
+    "property": {
+    "analyze":true,
+    "scf summary":true
+  },
+  "rttddft": {
+    "target":4,
+    "tddft file":"mol_tddft.out",
+    "S2": true,
+    "dt": 0.02,
+    "tmax": 100.0,
+    "output":"rt_data.mol_ehrenfest.dat",
+    "propagation basis": "OAO",
+    "propagator": "magnus_interpol",
+    "field": {
+      "type":"gaussian",
+      "E0": 0.0001,
+      "t0": 30.0,
+      "sigma": 10.0,
+      "freq": "target",
+      "phase": 0,
+      "polarization": "target",
+      "hand":"right"
+    },
+    "ehrenfest": {
+      "enabled": true,
+      "n_electronic": 1,
+      "velocities": "input.xyz"
+    }
+  }
+}

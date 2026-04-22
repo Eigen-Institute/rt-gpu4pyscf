@@ -76,12 +76,58 @@ scfTime=time.time()
 print("\n   scf wall time: ",scfTime-startTime," s \n\n")
 
 
-rt = RTTDDFT(ks,basis=params[3].get('propagation basis','MO'))
-md_data = None
-dt = params[3].get('dt', 0.05)
-tmax = params[3].get('tmax', 1.0)
-propagator = params[3].get('propagator', 'magnus_interpol')
-n_electronic = 1  # unused for RT-TDDFT (no nuclei moving)
+# Define MD Simulation (Ehrenfest or BOMD)
+ehrenfest_data = params[7]
+qmd_data = input_data.get('qmd')
+ehrenfest_enabled = ehrenfest_data and ehrenfest_data.get('enabled', False)
+qmd_enabled = qmd_data is not None
+
+from gpu4pyscf.tdscf.ehrenfest import EhrenfestMD, BOMD
+
+if qmd_enabled:
+    rt = BOMD(ks)
+    md_data = qmd_data
+    dt = md_data.get('dt_nucl', 0.05) 
+    tmax = md_data.get('nstep_nucl', 10) * dt
+    propagator = 'none'
+    print("Born-Oppenheimer Molecular Dynamics (QMD) enabled.")
+elif ehrenfest_enabled:
+    rt = EhrenfestMD(ks, basis=params[3].get('propagation basis','OAO'))
+    md_data = ehrenfest_data
+    dt = params[3].get('dt', 0.05)
+    tmax = params[3].get('tmax', 1.0)
+    propagator = params[3].get('propagator', 'magnus_interpol')
+    n_electronic = ehrenfest_data.get('n_electronic', 1)
+    print(f"Ehrenfest Dynamics enabled (n_electronic={n_electronic}).")
+else:
+    rt = RTTDDFT(ks,basis=params[3].get('propagation basis','MO'))
+    md_data = None
+    dt = params[3].get('dt', 0.05)
+    tmax = params[3].get('tmax', 1.0)
+    propagator = params[3].get('propagator', 'magnus_interpol')
+    n_electronic = 1  # unused for RT-TDDFT (no nuclei moving)
+
+# Configure MD Parameters (Velocities, Thermostats, Frozen)
+if qmd_enabled or ehrenfest_enabled:
+    rt.frozen = md_data.get('frozen', False)
+    
+    if 'velocities' in md_data:
+        vel_input = md_data['velocities']
+        if isinstance(vel_input, str):
+            print(f"Loading velocities from {vel_input}...")
+            rt.velocities = rtu.load_velocities_from_xyz(vel_input)
+        else:
+            rt.velocities = np.array(vel_input)
+    
+    # Thermostat
+    thermo = md_data.get('thermostat')
+    if thermo:
+        if isinstance(thermo, str):
+             parts = thermo.split()
+             rt.thermostat = parts[0].lower()
+             if len(parts) > 1: rt.tau = float(parts[1])
+        rt.target_temp = md_data.get('targ_temp', 298.15)
+        print(f"Thermostat enabled: {rt.thermostat} at {rt.target_temp}K (tau={rt.tau} au)")
 
 rt.verbose=4
 rt.mu_spin='total'
@@ -99,6 +145,11 @@ hand = params[4].get('hand','right')
 # ... (match fieldType.lower() block remains same)
 
 # ... (getTargetStateFreq block remains same)
+# Dynamic Target Selection
+target_state = params[3].get('target')
+if target_state is not None:
+    freq, polarization = rtu.getTargetStateFreq(params,target_state)
+
 
 # Assign field type
 match fieldType.lower():
@@ -128,6 +179,20 @@ if params[3].get('S2', False):
     else:
         print("Warning: S2 reporting requested but system is closed-shell. Skipping.")
 
+# 2. Force Logger (if enabled in RT but not full MD)
+if params[3].get('forces', False) and not (ehrenfest_enabled or qmd_enabled):
+    print(f"Force logging enabled. Data will be written to {force_file}")
+    f_log = rtu.ForceLogger(force_file, rt)
+    callbacks.append(f_log)
+
+# 3. Ehrenfest/QMD Logger (trajectory)
+if ehrenfest_enabled or qmd_enabled:
+    print(f"Dynamics trajectory will be written to {traj_file} and {xyz_file}")
+    e_log = rtu.EhrenfestLogger(traj_file, mol)
+    callbacks.append(e_log)
+    x_log = rtu.XYZLogger(xyz_file, mol)
+    callbacks.append(x_log)
+
 # 4. Logging callback 
 logger = rtu.RTLogger(output_file,mo_file,rt.field_fn,isCs)
 callbacks.append(logger)
@@ -152,8 +217,16 @@ callback_fn = rtu.MultiCallback(callbacks)
 times = np.arange(0, tmax, dt) # Short test run
 
 # start Run
-print(f"Starting RT-TDDFT. Data will be written to {output_file}...")
-results = rt.kernel(times=times, dt=dt, propagator=propagator, callback=callback_fn)
+if qmd_enabled:
+    print(f"Starting QMD (BOMD). Data will be written to {output_file}...")
+    results = rt.kernel(times=times, dt=dt, callback=callback_fn)
+elif ehrenfest_enabled:
+    print(f"Starting Ehrenfest MD. Data will be written to {output_file}...")
+    results = rt.kernel(times=times, dt=dt, propagator=propagator,
+                        callback=callback_fn, n_electronic=n_electronic)
+else:
+    print(f"Starting RT-TDDFT. Data will be written to {output_file}...")
+    results = rt.kernel(times=times, dt=dt, propagator=propagator, callback=callback_fn)
 
 # Finished
 print("\n\n   Propagation finished.\n")

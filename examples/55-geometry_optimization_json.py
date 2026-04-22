@@ -110,8 +110,14 @@ if props.get('Hessian', False) or props.get('vib', False):
             print(f"{i+1:5d} {freq:15.2f} {rm:15.4f}")
         
         # Save vibrational info to JSON
+        # Handle complex numbers (imaginary frequencies) for JSON serialization
+        freqs = vib_info['freq_wavenumber']
+        if np.iscomplexobj(freqs):
+            # Convert imaginary frequencies to negative real numbers
+            freqs = freqs.real - np.abs(freqs.imag)
+            
         vib_results = {
-            "frequencies_cm1": vib_info['freq_wavenumber'].tolist(),
+            "frequencies_cm1": freqs.tolist(),
             "reduced_mass_amu": vib_info['reduced_mass'].tolist(),
             "normal_modes": vib_info['norm_mode'].tolist()
         }
