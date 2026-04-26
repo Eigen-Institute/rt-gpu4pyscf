@@ -43,6 +43,16 @@ def get_ehrenfest_force(rt_obj, dm_ao, t=0.0):
     '''
     mol = rt_obj.mol
     mf = rt_obj.ks
+
+    # Re-Hermitianize the density matrix.  Q-transport and unitary propagation
+    # preserve Hermiticity only to float precision (~1e-14).  Tiny residual
+    # non-(anti)symmetry in (dm_re, dm_im) is amplified to O(1) by the gpu4pyscf
+    # gradient path, so we enforce exact (P + P†)/2 here.
+    if dm_ao.ndim == 3:  # UKS: stack of (alpha, beta)
+        dm_ao = 0.5 * (dm_ao + dm_ao.conj().swapaxes(-1, -2))
+    else:
+        dm_ao = 0.5 * (dm_ao + dm_ao.conj().T)
+
     g = mf.Gradients()
     g.grid_response = True
     
@@ -387,39 +397,48 @@ class EhrenfestMD(BaseMD):
             if t_target <= t_now + 1e-6: continue
 
             # Advance by electronic sub-steps until t_now reaches t_target.
+            #
+            # Multi-scale scheme (static-then-jump): within each nuclear step,
+            # the n_electronic electronic sub-steps see a STATIC geometry R(t).
+            # Nuclei jump to R(t+dt_n) only at the nuclear boundary. The basis
+            # motion is then applied as a single unitary transport of dm_orth
+            # (exp(-D_dt)) followed by the Verlet velocity corrector.
             while t_now < t_target - 1e-6:
                 j = total_sub % n_electronic
 
-                if j == 0:
-                    # Start of a new nuclear step
-                    if not self.frozen:
-                        accel = self.forces / self.masses[:, None]
-                        v_mid = self.velocities + 0.5 * accel * dt_n
-                        r_next = coords + v_mid * dt_n
-                        mol_prev_sub = mol.copy()
-                        x_mat_prev_sub = self.x_mat.copy()
-                    if propagator == 'magnus_interpol':
-                        f_orth_prev = self._build_f_orth(dm_orth, t_now)
+                if j == 0 and not self.frozen:
+                    # Verlet predictor; snapshot old mol/X for later D_dt.
+                    accel = self.forces / self.masses[:, None]
+                    v_mid = self.velocities + 0.5 * accel * dt_n
+                    r_next = coords + v_mid * dt_n
+                    mol_prev_sub = mol.copy()
+                    x_mat_prev_sub = self.x_mat.copy()
 
-                if self.frozen:
-                    D_dt_sub = None
-                else:
-                    tau_end = (j + 1) / n_electronic
-                    R_tau = coords + tau_end * (r_next - coords)
-                    mol.set_geom_(R_tau, unit='Bohr')
-                    mf.reset(mol)
-                    self._update_basis()
-                    D_dt_sub = self._compute_D_dt(mol_prev_sub, x_mat_prev_sub)
-
+                # Electronic sub-step at the CURRENT (static) geometry.
+                if j == 0 and propagator == 'magnus_interpol':
+                    f_orth_prev = self._build_f_orth(dm_orth, t_now)
                 dm_orth = self._electronic_step(dm_orth, t_now, dt_e, propagator,
-                                                f_orth_t=f_orth_prev, D_dt=D_dt_sub)
+                                                f_orth_t=f_orth_prev, D_dt=None)
                 t_now += dt_e
                 total_sub += 1
 
                 if j == n_electronic - 1:
-                    # End of a nuclear step: forces + Verlet corrector.
-                    # (Energies are computed by _record_md at record time.)
                     if not self.frozen:
+                        # Nuclear jump: R(t) -> R(t+dt_n). One set_geom_ call.
+                        mol.set_geom_(r_next, unit='Bohr')
+                        mf.reset(mol)
+                        self._update_basis()
+                        # Basis transport across the jump: D_dt_tot is the full
+                        # anti-Hermitian basis-motion matrix over the nuclear
+                        # step. Apply unitary rotation dm_orth -> Q dm_orth Q†
+                        # with Q = exp(-D_dt_tot).
+                        D_dt_tot = self._compute_D_dt(mol_prev_sub, x_mat_prev_sub)
+                        Q = self._basis_transport_unitary(D_dt_tot)
+                        if self.is_uks:
+                            dm_orth = Q @ dm_orth @ Q.conj().swapaxes(-1, -2)
+                        else:
+                            dm_orth = Q @ dm_orth @ Q.conj().T
+                        # Forces at new geometry, Verlet corrector.
                         dm_ao = self.to_ao(dm_orth)
                         self.forces, _ = get_ehrenfest_force(self, dm_ao, t=t_now)
                         new_accel = self.forces / self.masses[:, None]
@@ -427,11 +446,8 @@ class EhrenfestMD(BaseMD):
                         coords = r_next
                     self._apply_thermostat(dt_n)
                 elif propagator == 'magnus_interpol':
-                    # Next sub-step within same nuclear step: prep snapshots.
+                    # Prep F_orth for the next electronic sub-step (same geom).
                     f_orth_prev = self._build_f_orth(dm_orth, t_now)
-                    if not self.frozen:
-                        mol_prev_sub = mol.copy()
-                        x_mat_prev_sub = self.x_mat.copy()
 
             # Reached t_target — record. _record_md recomputes the full
             # energy breakdown from dm_ao, so no mid-step cache is needed.
@@ -458,6 +474,16 @@ class EhrenfestMD(BaseMD):
         M = cupy.asarray(intor_cross('int1e_ovlp', mol_old, self.mol))
         XMX = x_mat_old.conj().T @ M @ self.x_mat
         return 0.5 * (XMX - XMX.conj().swapaxes(-1, -2))
+
+    def _basis_transport_unitary(self, D_dt):
+        '''Q = exp(-D_dt) for anti-Hermitian D_dt. Since iD_dt is Hermitian,
+        diagonalize iD_dt = v·diag(e)·v†, then D_dt = -i·v·diag(e)·v†, so
+        Q = exp(-D_dt) = v·diag(exp(i·e))·v†.'''
+        H = 1j * D_dt  # Hermitian
+        e, v = cupy.linalg.eigh(H)
+        # Column-wise scale of v by exp(i·e), then matmul with v†
+        scaled = v * cupy.exp(1j * e)  # broadcasts along last axis
+        return scaled @ v.conj().swapaxes(-1, -2)
 
     def _build_f_orth(self, dm_orth, t):
         dm_ao = self.to_ao(dm_orth)
