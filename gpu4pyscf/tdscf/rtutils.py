@@ -184,6 +184,9 @@ class Field:
     '''
     Helper class to generate common electric field functions for RT-TDDFT.
     '''
+    #
+    #   Gaussian Envelope
+    #
     @staticmethod
     def gaussian_pulse(E0=0.01, t0=10.0, sigma=1.0, freq=0.0, phase=0.0, polarization='z',hand=None):
         '''
@@ -248,6 +251,9 @@ class Field:
                 return vec * tvec
         return _field
 
+    #
+    #   Continuous Wave
+    #
     @staticmethod
     def cw_field(E0=0.001, freq=0.01, phase=0.0, polarization='z', hand=None):
         '''Creates a CW sinusoidal field '''
@@ -296,7 +302,9 @@ class Field:
                 return vec * tvec
         return _field
 
-       
+    #
+    #   Step Function
+    #  
     @staticmethod
     def step_function(E0=0.01, t_start=0.0, polarization='z'):
         '''Creates a step function field (constant after t_start).'''
@@ -322,6 +330,35 @@ class Field:
             else:
                 return np.zeros(3)
         return _field
+    #
+    #   Delta kick
+    #
+    @staticmethod
+    def delta_function(E0=0.01, t_start=0.0, polarization='z'):
+        '''Creates a delta function field (max @ t=0, zero thereafter).'''
+        dirs = {'x': 0, 'y': 1, 'z': 2}
+        if isinstance(polarization, str):
+            d_idx = dirs.get(polarization.lower(), 2)
+            vec = np.zeros(3)
+            vec[d_idx] = 1.0
+        elif isinstance(polarization, dict):
+            theta = polarization.get('theta', 0.0)
+            phi = polarization.get('phi', 0.0)
+            vec = np.array([
+                np.sin(theta) * np.cos(phi),
+                np.sin(theta) * np.sin(phi),
+                np.cos(theta)
+            ])
+        else:
+            vec = np.array(polarization) / np.linalg.norm(polarization)
+        
+        def _field(t):
+            if t >= 0.0:
+                return vec * E0
+            else:
+                return np.zeros(3)
+        return _field
+
 
 
 class RTLogger:
