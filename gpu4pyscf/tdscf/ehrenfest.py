@@ -561,22 +561,116 @@ class EhrenfestMD(BaseMD):
         return xi @ dm_ao @ xi.conj().swapaxes(-1, -2) if self.is_uks else xi @ dm_ao @ xi.conj().T
 
 class BOMD(BaseMD):
-    '''Born-Oppenheimer Molecular Dynamics implementation.'''
+    '''Born-Oppenheimer Molecular Dynamics on a single PES.
+
+    Supports ground-state (state=0) and excited-state (state>=1) surfaces. For
+    excited states, supply an LR-TDDFT (or TDA / TDHF) object via `td`; the
+    integrator routes forces through `td.Gradients().as_scanner(state=state)`
+    so each step gets (e_tot, gradient) consistent with the chosen root.
+
+    Energy-ordered state-following: when `track_state=True` (default), at every
+    step we examine `td.e` and check that the requested root remains in its
+    expected energy slot. If a neighbor crosses, we re-assign `self.state` to
+    keep tracking the same physical surface (warning emitted, history kept in
+    `results['state_history']`). This matches NWChem's `qmd_elec_prop.F`
+    behavior for non-NAMD QMD; character-based tracking is left as a future
+    extension.
+    '''
+    def __init__(self, ks, td=None, state=0, track_state=True,
+                 com_step=100, basis='OAO'):
+        super().__init__(ks, basis=basis)
+        self.td = td
+        self.state = int(state)
+        self.track_state = bool(track_state)
+        self.com_step = int(com_step)
+        self._scanner = None
+        self._keys.update({'td', 'state', 'track_state', 'com_step'})
+
+    def _build_scanner(self):
+        '''Build the (mol) -> (e_tot, grad) callable for the chosen surface.
+        Cached on self._scanner. The scanner internally re-runs SCF (and TD
+        for excited states) with previous-step amplitudes as the initial
+        guess.'''
+        if self._scanner is not None:
+            return self._scanner
+        if self.state == 0:
+            self._scanner = self.ks.nuc_grad_method().as_scanner()
+        else:
+            if self.td is None:
+                raise ValueError("BOMD on excited surface (state >= 1) "
+                                 "requires a TDDFT object; pass td=...")
+            if getattr(self.td, 'nstates', 0) < self.state:
+                raise ValueError(
+                    f"td.nstates ({getattr(self.td, 'nstates', 0)}) is less "
+                    f"than the requested state ({self.state}). "
+                    "Increase nstates or lower state.")
+            self._scanner = self.td.Gradients().as_scanner(state=self.state)
+        return self._scanner
+
+    def _check_state_following(self, prev_state_energy, log):
+        '''Energy-ordered re-assignment after each scanner call. Returns the
+        possibly-updated state index. Mutates self.state in place.
+
+        prev_state_energy: total energy of the tracked state at the previous
+        nuclear step (None on the first call). Used to identify which new
+        index is closest to the surface we were on.
+        '''
+        if not self.track_state or self.state == 0 or self.td is None:
+            return self.state
+        try:
+            te = cupy.asnumpy(self.td.e)
+        except Exception:
+            te = np.asarray(self.td.e)
+        if te is None or len(te) < self.state:
+            return self.state
+        # Energies are sorted by td.kernel(); the issue is when a previously
+        # higher-lying state has dropped below the tracked one (or vice versa).
+        # Compare e_tot[s] = mf.e_tot + te[s-1] across roots: te is already
+        # excitation energies relative to GS, so the order of te equals the
+        # order of e_tot. A change in tracked-state identity manifests as the
+        # closest-to-prev_energy index shifting.
+        if prev_state_energy is not None:
+            mf_e = float(self.ks.e_tot)
+            candidates = mf_e + te
+            new_idx = int(np.argmin(np.abs(candidates - prev_state_energy))) + 1
+            if new_idx != self.state:
+                log.warn("BOMD state-following: tracked state re-assigned from "
+                         f"{self.state} to {new_idx} "
+                         f"(closest energy match: |dE|="
+                         f"{abs(candidates[new_idx-1] - prev_state_energy):.3e} Ha)")
+                self.state = new_idx
+                # Rebuild scanner so kernel call uses new state
+                self._scanner = None
+                self._scanner = self._build_scanner()
+        return self.state
+
     def kernel(self, times, dt=0.02, callback=None):
         log = logger.new_logger(self, self.verbose)
         mol, mf = self.mol, self.ks
-        mf.kernel()
-        dm_ao = cupy.asarray(mf.make_rdm1()).astype(cupy.complex128)
+        scanner = self._build_scanner()
+
         coords = mol.atom_coords()
         if self.velocities is None: self.velocities = np.zeros_like(coords)
         if self.frozen: self.velocities *= 0.0
-        
-        self.forces = -mf.Gradients().kernel()
-        self.energy_elec = mf.e_tot
-        results = {'times': [], 'coords': [], 'velocities': [], 'forces': [], 'energy_elec': [], 'energy_tot': []}
+
+        # Initial energy + force on the chosen surface (also runs the SCF/TD).
+        e_tot, de = scanner(mol)
+        self.forces = -np.asarray(de)
+        self.energy_elec = float(e_tot)
+        prev_state_energy = self.energy_elec
+
+        # Density matrix for trajectory logging only (BOMD propagation does
+        # not depend on dm_ao).
+        dm_ao = cupy.asarray(mf.make_rdm1()).astype(cupy.complex128)
+
+        results = {'times': [], 'coords': [], 'velocities': [], 'forces': [],
+                   'energy_elec': [], 'energy_tot': [], 'state_history': []}
         t_now = 0.0
         self._record_md(t_now, dm_ao, coords, results)
+        results['state_history'].append(self.state)
         if callback: callback(t_now, dm_ao, results)
+
+        nuclear_step = 0
         for t_target in times:
             if t_target <= t_now + 1e-6: continue
             steps = int(np.floor((t_target - t_now) / dt + 1e-6))
@@ -585,20 +679,29 @@ class BOMD(BaseMD):
                 if not self.frozen:
                     accel = self.forces / self.masses[:, None]
                     self.velocities += 0.5 * accel * dt
-                    coords += self.velocities * dt
+                    coords = coords + self.velocities * dt
                     mol.set_geom_(coords, unit='Bohr')
-                    mf.reset(mol)
-                mf.kernel() 
-                self.energy_elec = mf.e_tot
-                new_forces = -mf.Gradients().kernel()
+                # Scanner does mf.reset(mol) + SCF + (TD) + gradient internally.
+                e_tot, de = scanner(mol)
+                self.energy_elec = float(e_tot)
+                new_forces = -np.asarray(de)
                 if not self.frozen:
                     new_accel = new_forces / self.masses[:, None]
                     self.velocities += 0.5 * new_accel * dt
                 self.forces = new_forces
                 self._apply_thermostat(dt)
                 t_now += dt
+                nuclear_step += 1
+                # State-following + occasional COM removal.
+                self._check_state_following(prev_state_energy, log)
+                prev_state_energy = self.energy_elec
+                if (self.com_step > 0 and not self.frozen
+                        and nuclear_step % self.com_step == 0):
+                    from gpu4pyscf.tdscf import rtutils as rtu
+                    rtu.remove_com_momentum(self.masses, self.velocities)
             dm_ao = cupy.asarray(mf.make_rdm1()).astype(cupy.complex128)
             self._record_md(t_now, dm_ao, coords, results)
+            results['state_history'].append(self.state)
             if callback: callback(t_now, dm_ao, results)
-            log.info(f"Time: {t_now:10.4f} au | Energy: {results['energy_tot'][-1]:20.12f}")
+            log.info(f"Time: {t_now:10.4f} au | Energy: {results['energy_tot'][-1]:20.12f} | state: {self.state}")
         return results

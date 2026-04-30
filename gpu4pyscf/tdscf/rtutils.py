@@ -640,6 +640,50 @@ def load_velocities_from_xyz(filename):
     return np.array(velocities)
 
 
+# Boltzmann constant in atomic units (Hartree / Kelvin).
+KB_HARTREE = 3.166811563e-6
+
+
+def maxwell_boltzmann_velocities(masses, temperature, rng=None):
+    '''Sample atomic velocities from a Maxwell-Boltzmann distribution.
+
+    masses:      (natm,) atomic masses in atomic units (= amu * 1822.888486).
+    temperature: target temperature in Kelvin.
+    rng:         optional numpy Generator for reproducibility.
+
+    Returns (natm, 3) velocities in atomic units. Net translational momentum
+    is NOT removed here — call remove_com_momentum() afterwards if desired.
+    '''
+    if rng is None:
+        rng = np.random.default_rng()
+    masses = np.asarray(masses).reshape(-1)
+    sigma = np.sqrt(KB_HARTREE * float(temperature) / masses)  # (natm,)
+    return sigma[:, None] * rng.standard_normal(size=(masses.size, 3))
+
+
+def remove_com_momentum(masses, velocities, remove_rotation=False):
+    '''Subtract translational (and optionally rotational) center-of-mass
+    momentum from velocities, in place.
+
+    Returns the modified velocities array (same object as input). Convention
+    matches BaseMD: masses in atomic units, velocities in atomic units.
+    '''
+    masses = np.asarray(masses).reshape(-1)
+    M = float(masses.sum())
+    if M <= 0.0:
+        return velocities
+    v_com = (masses[:, None] * velocities).sum(axis=0) / M
+    velocities -= v_com[None, :]
+    if remove_rotation:
+        # Remove angular momentum about the center of mass. Solving
+        # L = I * omega for omega and subtracting r x omega per atom.
+        # Requires positions; left as an extension since BOMD currently
+        # only invokes COM-translational removal periodically.
+        raise NotImplementedError(
+            "remove_rotation=True needs the current coords; not yet wired up.")
+    return velocities
+
+
 def write_transition_density_cube(td_obj, state_id, filename, cube_data={}, spin='total'):
 
     '''

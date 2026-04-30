@@ -85,12 +85,26 @@ qmd_enabled = qmd_data is not None
 from gpu4pyscf.tdscf.ehrenfest import EhrenfestMD, BOMD
 
 if qmd_enabled:
-    rt = BOMD(ks)
     md_data = qmd_data
-    dt = md_data.get('dt_nucl', 0.05) 
+    dt = md_data.get('dt_nucl', 0.05)
     tmax = md_data.get('nstep_nucl', 10) * dt
     propagator = 'none'
-    print("Born-Oppenheimer Molecular Dynamics (QMD) enabled.")
+    qmd_state = int(md_data.get('state', 0))
+    if qmd_state >= 1:
+        # Excited-state BOMD: build a TDDFT (or TDA) object on top of ks.
+        tda = bool(md_data.get('tda', False))
+        nstates = int(md_data.get('nstates', max(qmd_state, 5)))
+        td = ks.TDA() if tda else ks.TDDFT()
+        td.nstates = nstates
+        td.kernel()
+        rt = BOMD(ks, td=td, state=qmd_state,
+                  track_state=bool(md_data.get('track_state', True)),
+                  com_step=int(md_data.get('com_step', 100)))
+        print(f"BOMD enabled on excited-state surface (state={qmd_state}, "
+              f"{'TDA' if tda else 'TDDFT'}, nstates={nstates}).")
+    else:
+        rt = BOMD(ks, com_step=int(md_data.get('com_step', 100)))
+        print("BOMD enabled (ground state).")
 elif ehrenfest_enabled:
     rt = EhrenfestMD(ks, basis=params[3].get('propagation basis','OAO'))
     md_data = ehrenfest_data
@@ -118,7 +132,16 @@ if qmd_enabled or ehrenfest_enabled:
             rt.velocities = rtu.load_velocities_from_xyz(vel_input)
         else:
             rt.velocities = np.array(vel_input)
-    
+    elif 'init_vel_temperature' in md_data:
+        # Sample Maxwell-Boltzmann velocities at the requested temperature.
+        T_init = float(md_data['init_vel_temperature'])
+        seed = md_data.get('init_vel_seed')
+        rng = np.random.default_rng(seed) if seed is not None else None
+        rt.velocities = rtu.maxwell_boltzmann_velocities(rt.masses, T_init, rng=rng)
+        rtu.remove_com_momentum(rt.masses, rt.velocities)
+        print(f"Maxwell-Boltzmann velocity init at T={T_init} K"
+              + (f" (seed={seed})" if seed is not None else ""))
+
     # Thermostat
     thermo = md_data.get('thermostat')
     if thermo:
