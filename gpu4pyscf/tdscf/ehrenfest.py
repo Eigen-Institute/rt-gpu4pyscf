@@ -568,23 +568,37 @@ class BOMD(BaseMD):
     integrator routes forces through `td.Gradients().as_scanner(state=state)`
     so each step gets (e_tot, gradient) consistent with the chosen root.
 
-    Energy-ordered state-following: when `track_state=True` (default), at every
-    step we examine `td.e` and check that the requested root remains in its
-    expected energy slot. If a neighbor crosses, we re-assign `self.state` to
-    keep tracking the same physical surface (warning emitted, history kept in
-    `results['state_history']`). This matches NWChem's `qmd_elec_prop.F`
-    behavior for non-NAMD QMD; character-based tracking is left as a future
-    extension.
+    State-following: when `track_state=True` (default), after each scanner
+    call we re-assign `self.state` if the tracked surface has been re-ordered
+    relative to the previous step. Two methods are supported via
+    `tracking_method`:
+
+      * 'overlap' -- transition-density overlap of the new td.xy against the
+        previous step's amplitudes (correct at avoided crossings).
+      * 'energy' -- closest E_tot to the previous step (NWChem qmd_elec_prop.F
+        style; weak when state energies bunch up).
+      * 'auto' (default) -- prefer overlap; fall back to energy if the tracker
+        errors out for any reason.
+
+    State changes are logged and `results['state_history']` records the index
+    used at each output time.
     '''
     def __init__(self, ks, td=None, state=0, track_state=True,
-                 com_step=100, basis='OAO'):
+                 tracking_method='auto', com_step=100, basis='OAO'):
         super().__init__(ks, basis=basis)
         self.td = td
         self.state = int(state)
         self.track_state = bool(track_state)
+        if tracking_method not in ('auto', 'overlap', 'energy'):
+            raise ValueError(
+                f"tracking_method must be 'auto'/'overlap'/'energy', "
+                f"got {tracking_method!r}")
+        self.tracking_method = tracking_method
         self.com_step = int(com_step)
         self._scanner = None
-        self._keys.update({'td', 'state', 'track_state', 'com_step'})
+        self._tracker = None  # built lazily on first overlap-tracker call
+        self._keys.update({'td', 'state', 'track_state', 'tracking_method',
+                           'com_step'})
 
     def _build_scanner(self):
         '''Build the (mol) -> (e_tot, grad) callable for the chosen surface.
@@ -608,38 +622,77 @@ class BOMD(BaseMD):
         return self._scanner
 
     def _check_state_following(self, prev_state_energy, log):
-        '''Energy-ordered re-assignment after each scanner call. Returns the
-        possibly-updated state index. Mutates self.state in place.
-
-        prev_state_energy: total energy of the tracked state at the previous
-        nuclear step (None on the first call). Used to identify which new
-        index is closest to the surface we were on.
+        '''Re-assign the tracked state index after a scanner call, using the
+        configured tracking method. Returns the (possibly updated) state;
+        mutates self.state in place.
         '''
         if not self.track_state or self.state == 0 or self.td is None:
             return self.state
+        method = self.tracking_method
+        if method == 'auto':
+            try:
+                return self._check_overlap(log)
+            except Exception as e:
+                log.warn(
+                    f"BOMD overlap tracker failed ({type(e).__name__}: {e}); "
+                    "falling back to energy-based tracking.")
+                return self._check_energy(prev_state_energy, log)
+        if method == 'overlap':
+            return self._check_overlap(log)
+        return self._check_energy(prev_state_energy, log)
+
+    def _check_overlap(self, log):
+        '''Transition-density-overlap state following. On the first call,
+        anchors a tracker against the current td.xy. On subsequent calls,
+        compares the new td.xy against the previous step's anchor, picks the
+        best-matching root, then re-anchors for the next step.
+        '''
+        from gpu4pyscf.tdscf.state_tracking import TransitionDensityTracker
+        if self._tracker is None:
+            self._tracker = TransitionDensityTracker(self.td, state_ref=self.state)
+            return self.state
+
+        match = self._tracker.assign(self.td, require_converged=False)
+        new_state = match.state_1indexed()
+        if 'low_overlap' in match.flags or 'near_degenerate' in match.flags:
+            log.warn(
+                f"BOMD overlap tracker: |S|={match.overlap:.3f}, "
+                f"runner-up={match.runner_up}, flags={match.flags}")
+        if new_state != self.state:
+            log.warn(
+                f"BOMD overlap state-following: tracked state {self.state} -> "
+                f"{new_state} (|S|={match.overlap:.3f}, "
+                f"|dE|={match.de_target:.3e} Ha)")
+            self.state = new_state
+            self._scanner = None
+            self._scanner = self._build_scanner()
+        # Re-anchor against the (possibly new) state for the next step's
+        # comparison -- rolling reference handles smooth character drift.
+        self._tracker.re_anchor(self.td, state_ref=self.state)
+        return self.state
+
+    def _check_energy(self, prev_state_energy, log):
+        '''Energy-ordered state-following. NWChem qmd_elec_prop.F-style.
+        prev_state_energy is the total energy at the previous nuclear step
+        (None on the first call); we re-assign self.state to whichever root
+        of the new td.e is closest to it.
+        '''
         try:
             te = cupy.asnumpy(self.td.e)
         except Exception:
             te = np.asarray(self.td.e)
         if te is None or len(te) < self.state:
             return self.state
-        # Energies are sorted by td.kernel(); the issue is when a previously
-        # higher-lying state has dropped below the tracked one (or vice versa).
-        # Compare e_tot[s] = mf.e_tot + te[s-1] across roots: te is already
-        # excitation energies relative to GS, so the order of te equals the
-        # order of e_tot. A change in tracked-state identity manifests as the
-        # closest-to-prev_energy index shifting.
         if prev_state_energy is not None:
             mf_e = float(self.ks.e_tot)
             candidates = mf_e + te
             new_idx = int(np.argmin(np.abs(candidates - prev_state_energy))) + 1
             if new_idx != self.state:
-                log.warn("BOMD state-following: tracked state re-assigned from "
-                         f"{self.state} to {new_idx} "
-                         f"(closest energy match: |dE|="
-                         f"{abs(candidates[new_idx-1] - prev_state_energy):.3e} Ha)")
+                log.warn(
+                    "BOMD energy state-following: tracked state re-assigned "
+                    f"from {self.state} to {new_idx} (|dE|="
+                    f"{abs(candidates[new_idx-1] - prev_state_energy):.3e} Ha)")
                 self.state = new_idx
-                # Rebuild scanner so kernel call uses new state
                 self._scanner = None
                 self._scanner = self._build_scanner()
         return self.state

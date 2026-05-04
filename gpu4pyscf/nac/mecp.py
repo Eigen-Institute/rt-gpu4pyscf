@@ -49,8 +49,16 @@ class MECPScanner:
     This scanner computes an effective energy and gradient for the MECP
     optimization problem based on the direct method described in
     Chem. Phys. Lett. 223 (1994) 269-274.
+
+    Both crossing states are followed by transition-density character via
+    a pair of TransitionDensityTrackers, so root re-ordering through the
+    seam doesn't silently swap the two states. ``self.states`` is kept
+    sorted by current energy (states[0] = lower) so the Bearpark formula
+    (which assumes states[1] is the energetically-upper state for the
+    branching-plane projection of g2) remains valid even after a crossing.
     """
     def __init__(self, optimizer):
+        from gpu4pyscf.tdscf.state_tracking import TransitionDensityTracker
         self.optimizer = optimizer
         self.mol = optimizer.mol
         self.td = optimizer.td
@@ -65,6 +73,38 @@ class MECPScanner:
         # Create scanners for the underlying SCF and TD-SCF objects
         self._mf_scanner = self.mf.as_scanner()
         self._td_scanner = self.td.as_scanner()
+
+        # One tracker per crossing-state character. Anchored at the initial
+        # geometry; re-anchored each step so character drift is followed
+        # smoothly. ``_tracker_a`` follows the character that was lower in
+        # energy at init, ``_tracker_b`` the higher; after a crossing they
+        # may swap which energy slot they occupy in self.states.
+        self._tracker_a = TransitionDensityTracker(
+            self.td, state_ref=self.states[0])
+        self._tracker_b = TransitionDensityTracker(
+            self.td, state_ref=self.states[1])
+
+    def _resolve_pair(self):
+        """Assign each tracker to a distinct root in the current self.td.
+        On conflict (both top-matched the same root), the higher-overlap
+        match keeps its top pick and the other falls back to its runner-up.
+        Returns ``(root_a, root_b, match_a, match_b)`` with 0-indexed roots.
+        """
+        match_a = self._tracker_a.assign(self.td, require_converged=False)
+        match_b = self._tracker_b.assign(self.td, require_converged=False)
+        if match_a.root != match_b.root:
+            return match_a.root, match_b.root, match_a, match_b
+        if match_a.overlap >= match_b.overlap:
+            self.log.warn(
+                f"MECP tracker conflict on root {match_a.root + 1}: "
+                f"|S_a|={match_a.overlap:.3f} >= |S_b|={match_b.overlap:.3f}; "
+                f"b falls back to runner-up {match_b.runner_up[0] + 1}.")
+            return match_a.root, match_b.runner_up[0], match_a, match_b
+        self.log.warn(
+            f"MECP tracker conflict on root {match_a.root + 1}: "
+            f"|S_b|={match_b.overlap:.3f} > |S_a|={match_a.overlap:.3f}; "
+            f"a falls back to runner-up {match_a.runner_up[0] + 1}.")
+        return match_a.runner_up[0], match_b.root, match_a, match_b
 
     def __call__(self, mol_or_geom, **kwargs):
         """
@@ -92,6 +132,21 @@ class MECPScanner:
             e_states = self.td.e
         else: # For UKS/UHF based TD
             e_states = self.td.energies / HARTREE2EV
+
+        # Re-target self.states to the matched character pair, ordered by
+        # current energy so states[0] stays the lower-energy slot.
+        root_a, root_b, match_a, match_b = self._resolve_pair()
+        if float(e_states[root_a]) <= float(e_states[root_b]):
+            new_states = (root_a + 1, root_b + 1)
+        else:
+            new_states = (root_b + 1, root_a + 1)
+        if new_states != self.states:
+            self.log.warn(
+                f"MECP state slots re-assigned: {self.states} -> {new_states} "
+                f"(|S_a|={match_a.overlap:.3f}, |S_b|={match_b.overlap:.3f})")
+            self.states = new_states
+        self._tracker_a.re_anchor(self.td, state_ref=root_a + 1)
+        self._tracker_b.re_anchor(self.td, state_ref=root_b + 1)
 
         E1 = float(e_states[self.states[0]-1] + e_tot)
         E2 = float(e_states[self.states[1]-1] + e_tot)

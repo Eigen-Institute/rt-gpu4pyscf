@@ -213,7 +213,7 @@ def grad_elec(td_grad, x_y, singlet=True, atmlst=None, verbose=logger.INFO,
     return de
 
 
-def as_scanner(td_grad, state=1):
+def as_scanner(td_grad, state=1, tracker=None):
     '''Generating a nuclear gradients scanner/solver (for geometry optimizer).
 
     The returned solver is a function. This function requires one argument
@@ -226,6 +226,16 @@ def as_scanner(td_grad, state=1):
 
     Note scanner has side effects.  It may change many underlying objects
     (_scf, with_df, with_x2c, ...) during calculation.
+
+    Parameters
+    ----------
+    tracker : TransitionDensityTracker | None, optional
+        If provided, after each SCF + TDDFT solve at the new geometry the
+        scanner consults the tracker to identify which root corresponds to
+        the previous step's tracked state, retargets ``self.state`` to the
+        matched root, and re-anchors the tracker for the next call (rolling
+        reference). This closes root-flipping silently mis-assigning
+        gradients during excited-state geometry optimization.
     '''
     if isinstance(td_grad, lib.GradScanner):
         return td_grad
@@ -235,17 +245,18 @@ def as_scanner(td_grad, state=1):
 
     logger.info(td_grad, 'Create scanner for %s', td_grad.__class__)
     name = td_grad.__class__.__name__ + TDSCF_GradScanner.__name_mixin__
-    return lib.set_class(TDSCF_GradScanner(td_grad, state),
+    return lib.set_class(TDSCF_GradScanner(td_grad, state, tracker=tracker),
                          (TDSCF_GradScanner, td_grad.__class__), name)
 
 
 class TDSCF_GradScanner(lib.GradScanner):
     _keys = {'e_tot'}
 
-    def __init__(self, g, state):
+    def __init__(self, g, state, *, tracker=None):
         lib.GradScanner.__init__(self, g)
         if state is not None:
             self.state = state
+        self._tracker = tracker
 
     def __call__(self, mol_or_geom, state=None, **kwargs):
         if isinstance(mol_or_geom, gto.MoleBase):
@@ -264,8 +275,23 @@ class TDSCF_GradScanner(lib.GradScanner):
         assert td_scanner.device == 'gpu'
         assert self.device == 'gpu'
         td_scanner(mol)
-        # TODO: Check root flip.  Maybe avoid the initial guess in TDHF otherwise
-        # large error may be found in the excited states amplitudes
+
+        # Optional transition-density root following: closes the historical
+        # "root flip" gap by re-targeting state to whatever root in the new
+        # td_scanner best matches the previous step's tracked character.
+        if self._tracker is not None:
+            match = self._tracker.assign(td_scanner, require_converged=False)
+            matched_state = match.state_1indexed()
+            if matched_state != state:
+                logger.warn(
+                    self,
+                    'TDDFT gradient scanner: tracked state %d -> %d '
+                    '(|S|=%.3f, |dE|=%.3e Ha)',
+                    state, matched_state, match.overlap, match.de_target)
+                state = matched_state
+                self.state = state
+            self._tracker.re_anchor(td_scanner, state_ref=state)
+
         de = self.kernel(state=state, **kwargs)
         e_tot = self.e_tot[state-1]
         return e_tot, de

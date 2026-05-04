@@ -185,6 +185,7 @@ def get_nacv_ge(td_nac, x_yI, delta=0.001, with_ris=False, singlet=True, atmlst=
 
 
 def get_nacv_ee(td_nac, x_yI, x_yJ, nJ, delta=0.001, with_ris=False, singlet=True, atmlst=None, verbose=logger.INFO):
+    from gpu4pyscf.tdscf.state_tracking import TransitionDensityTracker
     mf = td_nac.base._scf
     mol = mf.mol
     coords = mol.atom_coords(unit='Ang')*1.0
@@ -206,12 +207,24 @@ def get_nacv_ee(td_nac, x_yI, x_yJ, nJ, delta=0.001, with_ris=False, singlet=Tru
     if not isinstance(yJ, np.ndarray) and not isinstance(yJ, cp.ndarray):
         yJ = cp.zeros_like(xJ)
     yJ = cp.asarray(yJ).reshape(nocc, nvir)
-    gamma = np.block([[(-xJ@xI.T).get(), np.zeros((nocc, nvir))], 
+    gamma = np.block([[(-xJ@xI.T).get(), np.zeros((nocc, nvir))],
                     [np.zeros((nvir, nocc)), (xI.T@xJ).get()]]) * 2
     gamma = cp.asarray(gamma)
     gamma_ao = mo_coeff @ gamma @ mo_coeff.T
     s = mol.intor('int1e_ovlp')
     s = cp.asarray(s)
+
+    # Track the J-th state by transition-density overlap so the FD picks up
+    # the matched root at each displacement, even if the eigenvalue ordering
+    # has swapped.  ``nJ`` is kept as the seed for the reference root index;
+    # the tracker uses ``xJ`` to match at displaced geometries.
+    tracker = TransitionDensityTracker.from_amplitudes(
+        mol, mo_coeff, mo_occ, [(xJ, 0)], state_ref=1)
+
+    def _xy_list(xy_diag):
+        return [(cp.asarray(xy_diag[:, k]).reshape(nocc, nvir), 0)
+                for k in range(xy_diag.shape[1])]
+
     for iatm in range(natm):
         for icart in range(3):
             mol_add = get_new_mol(mol, coords, delta, iatm, icart)
@@ -219,20 +232,23 @@ def get_nacv_ee(td_nac, x_yI, x_yJ, nJ, delta=0.001, with_ris=False, singlet=Tru
             mol_minus = get_new_mol(mol, coords, -delta, iatm, icart)
             mf_minus, xy_diag_minus = get_mf_td(mol_minus, mf, s, mo_coeff, with_ris)
 
-            sign1 = 1.0
-            sign2 = 1.0
-            xJ_add = cp.asarray(xy_diag_add[:, nJ]).reshape(nocc, nvir)*cp.sqrt(0.5)
-            xJ_minus = cp.asarray(xy_diag_minus[:, nJ]).reshape(nocc, nvir)*cp.sqrt(0.5)
-            if (xJ*xJ_add).sum() < 0.0:
-                sign1 = -1.0
-            if (xJ*xJ_minus).sum() < 0.0:
-                sign2 = -1.0
-            
+            match_add = tracker.assign_amplitudes(
+                mol_add, mf_add.mo_coeff, _xy_list(xy_diag_add))
+            match_minus = tracker.assign_amplitudes(
+                mol_minus, mf_minus.mo_coeff, _xy_list(xy_diag_minus))
+
+            xJ_add = cp.asarray(
+                xy_diag_add[:, match_add.root]).reshape(nocc, nvir) \
+                * cp.sqrt(0.5) * match_add.sign
+            xJ_minus = cp.asarray(
+                xy_diag_minus[:, match_minus.root]).reshape(nocc, nvir) \
+                * cp.sqrt(0.5) * match_minus.sign
+
             mo_diff = (mf_add.mo_coeff - mf_minus.mo_coeff)/(delta*2.0)*0.52917721092
             dpq = mo_coeff.T @ s @ mo_diff
             nac[iatm, icart] = (gamma*dpq).sum()
 
-            t_diff = (xJ_add*sign1 - xJ_minus*sign2)/(delta*2.0)*0.52917721092
+            t_diff = (xJ_add - xJ_minus)/(delta*2.0)*0.52917721092
             nac3[iatm, icart] = (xI*t_diff).sum()*2 # for double occupancy
     
     nac2 = np.zeros((natm, 3))
