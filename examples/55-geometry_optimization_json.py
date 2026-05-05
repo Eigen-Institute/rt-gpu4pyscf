@@ -50,7 +50,23 @@ geomopt_data = input_data.get('geomopt', {})
 maxsteps = geomopt_data.get('maxsteps', 100)
 optimizedFile = geomopt_data.get('output_file', calcName + '_opt.xyz')
 
-mol_eq = geometric_solver.optimize(ks, maxsteps=maxsteps)
+# Constraints and Freezing atoms
+constraints = geomopt_data.get('constraints', None)
+freeze_data = geomopt_data.get('freeze', {})
+if 'atoms' in freeze_data:
+    atoms = freeze_data['atoms']
+    if isinstance(atoms, list):
+        # geomeTRIC uses 1-based indexing for constraints
+        atom_str = ",".join(map(str, atoms))
+        constraints_content = f"$freeze\nxyz {atom_str}\n"
+        
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as tmp:
+            tmp.write(constraints_content)
+            constraints = tmp.name
+        print(f"Freezing atoms: {atom_str}")
+
+mol_eq = geometric_solver.optimize(ks, maxsteps=maxsteps, constraints=constraints)
 print(mol_eq.tostring())
 
 # Get optimized coordinates in Angstroms

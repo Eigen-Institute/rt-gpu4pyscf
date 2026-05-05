@@ -14,7 +14,11 @@
   },
   "geomopt": {
     "maxsteps": 100,
-    "output_file": "optimized.xyz"
+    "output_file": "optimized.xyz",
+    "freeze": {
+        "atoms": [23,24,25,26]
+    },
+    "constraints": "constraints.txt"
   },
   "properties": {
     "Hessian": true,
