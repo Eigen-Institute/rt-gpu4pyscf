@@ -50,6 +50,7 @@ def parseInputJson(filename):
     viz_data = rttddft_data.get('visualization')
     mol_data = input_data.get('molecule', {})
     ehrenfest_data = rttddft_data.get('ehrenfest')
+    fssh_data = rttddft_data.get('fssh')
 
     # Name of the calculation
     calcName = input_data.get('calcName', 'rttddft_calc')
@@ -63,6 +64,7 @@ def parseInputJson(filename):
     opts.append(viz_data)
     opts.append({"name":calcName})
     opts.append(ehrenfest_data)
+    opts.append(fssh_data)
         
     return opts
 

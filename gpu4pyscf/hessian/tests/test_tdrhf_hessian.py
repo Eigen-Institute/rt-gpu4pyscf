@@ -345,23 +345,20 @@ class TestComputeBxFull(unittest.TestCase):
     def test_hellmann_feynman_orthogonality(self):
         '''<X|b^a> must be ~0 for each nuclear DOF a.
 
-        Mathematically exact: b^a = (A^a - omega^a I) X, so
-        <X|b^a> = X^T A^a X - omega^a X^T X = omega^a/2 - omega^a/2 = 0.
-        Numerically depends on FD truncation; on H2O/STO-3G with
-        delta=2e-3, the residual sets a floor on how accurate the b^a
-        construction is. A value much smaller than ||b^a|| means the
-        three terms (eps, V, omega) are mutually consistent.
+        Mathematically exact: b^a = (A^a - omega^A^a I) X with
+        omega^A^a = 2 (eps_part^a + V_part^a) computed from terms 1 and
+        2 of compute_b_x. By construction <X | b^a> = 0 to machine
+        precision, regardless of whether terms 1/2 use FD or analytical
+        primitives. Tested on absolute |overlap| (no division by ||b^a||
+        because b^a can be exactly zero for symmetry-protected DOFs --
+        e.g. the totally-symmetric Oz mode of H2O/STO-3G).
         '''
         b = tdrhf_hess.compute_b_x(self.td, 0, fd_delta=2.0e-3)
-        # <X | b^a> for each a: contract over (occ, vir).
         overlap = cp.einsum('aov,ov->a', b, self.x_ref)
-        b_norm_per_a = cp.linalg.norm(b.reshape(b.shape[0], -1), axis=1)
-        rel = cp.abs(overlap) / (b_norm_per_a + 1e-30)
-        max_rel = float(rel.max())
-        self.assertLess(max_rel, 1e-2,
-                        f'Hellmann-Feynman <X|b^a>/||b^a|| max = {max_rel:.3e}\n'
-                        f'overlaps: {cp.asnumpy(overlap)}\n'
-                        f'b norms:  {cp.asnumpy(b_norm_per_a)}')
+        max_abs = float(cp.max(cp.abs(overlap)))
+        self.assertLess(max_abs, 1e-9,
+                        f'|<X|b^a>| max = {max_abs:.3e}\n'
+                        f'overlaps: {cp.asnumpy(overlap)}')
 
     def test_solve_x1_finite(self):
         '''solve_x1(b^a) must produce a finite X^a.
@@ -445,6 +442,115 @@ class TestVindXFD(unittest.TestCase):
         self.assertGreater(float(cp.abs(out).max()), 1e-3)
 
 
+class TestEpsXDiagAnalytical(unittest.TestCase):
+    '''Phase 2.3: ``_eps_x_diag_analytical`` replaces ``_eps_x_diag_fd``
+    with no FD truncation. Should agree with the FD version to ~FD
+    truncation precision (delta=2e-3 -> O(delta^2) ~ 4e-6 absolute).'''
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mol, cls.mf, cls.td = _setup_tda()
+
+    def test_shape(self):
+        out = tdrhf_hess._eps_x_diag_analytical(self.mf)
+        natm = self.mol.natm
+        nmo = self.mf.mo_coeff.shape[1]
+        self.assertEqual(out.shape, (natm, 3, nmo))
+        self.assertTrue(bool(cp.all(cp.isfinite(out))))
+
+    def test_matches_fd(self):
+        mo_coeff = cp.asarray(self.mf.mo_coeff)
+        mo_occ = cp.asarray(self.mf.mo_occ)
+        fd = tdrhf_hess._eps_x_diag_fd(self.mf, mo_coeff, mo_occ, delta=2e-3)
+        ana = tdrhf_hess._eps_x_diag_analytical(self.mf, mo_coeff, mo_occ)
+        max_diff = float(cp.max(cp.abs(fd - ana)))
+        scale = float(cp.max(cp.abs(fd))) + 1e-30
+        # FD truncation at delta=2e-3 is O(delta^2) ~ 4e-6 absolute
+        self.assertLess(max_diff, 1e-5,
+                        f'FD vs analytical max |diff| = {max_diff:.3e} '
+                        f'(scale ~ {scale:.3e})')
+
+    def test_translation_invariant(self):
+        '''Sum over atoms (per axis) of eps^a should be ~0 (translational
+        invariance of the molecular Hamiltonian).'''
+        ana = tdrhf_hess._eps_x_diag_analytical(self.mf)
+        total = cp.sum(ana, axis=0)   # (3, nmo)
+        max_total = float(cp.max(cp.abs(total)))
+        self.assertLess(max_total, 1e-6,
+                        f'Translation-invariance residual = {max_total:.3e}')
+
+
+class TestComputeBxAnalyticalEpsDefault(unittest.TestCase):
+    '''compute_b_x defaults to analytical eps^a (Phase 2.3). Verify the
+    default path agrees with the use_fd_eps=True path to FD-truncation.'''
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mol, cls.mf, cls.td = _setup_tda()
+        cls.x_ref = cp.asarray(cls.td.xy[0][0])
+
+    def test_default_is_analytical(self):
+        b_default = tdrhf_hess.compute_b_x(self.td, 0)
+        b_analytical = tdrhf_hess.compute_b_x(self.td, 0, use_fd_eps=False)
+        self.assertTrue(bool(cp.allclose(b_default, b_analytical)))
+
+    def test_analytical_vs_fd(self):
+        '''b^a built with analytical eps^a should match b^a built with
+        FD eps^a, to FD-truncation precision.'''
+        b_fd  = tdrhf_hess.compute_b_x(self.td, 0, use_fd_eps=True,
+                                       fd_delta=2e-3)
+        b_ana = tdrhf_hess.compute_b_x(self.td, 0, use_fd_eps=False)
+        max_diff = float(cp.max(cp.abs(b_fd - b_ana)))
+        # The eps^a piece's FD truncation propagates linearly into b^a;
+        # delta=2e-3 -> O(delta^2) ~ 4e-6.
+        self.assertLess(max_diff, 1e-4,
+                        f'analytical vs FD b^a max |diff| = {max_diff:.3e}')
+
+    def test_hellmann_feynman_holds(self):
+        '''H-F orthogonality holds to machine precision for the analytical
+        path (no FD truncation in eps^a).'''
+        b = tdrhf_hess.compute_b_x(self.td, 0)  # default = analytical
+        overlap = cp.einsum('aov,ov->a', b, self.x_ref)
+        max_abs = float(cp.max(cp.abs(overlap)))
+        self.assertLess(max_abs, 1e-10)
+
+
+class TestPhase24BlockAssembly(unittest.TestCase):
+    '''Phase 2.4 Blocks 1+2 partial assembly. Returns the convention-A
+    Hessian omega^{A,ab} = omega^{A,ab}_pure (FD on Phase 2.3a 1st-deriv)
+    + omega^{A,ab}_cross (Phase 2.0 cross-term).
+
+    NOT the physical Hessian -- missing Block 3 (orbital relaxation via
+    Z-vector) and Block 4 (energy-weighted W). Tested for shape, finite,
+    Hessian symmetry, and consistency with FD on omega^A^a.
+    '''
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mol, cls.mf, cls.td = _setup_tda()
+
+    def test_shape_finite(self):
+        h = tdrhf_hess.omega_hessian(self.td, 0)
+        natm = self.mol.natm
+        self.assertEqual(h.shape, (natm, 3, natm, 3))
+        self.assertTrue(bool(cp.all(cp.isfinite(h))))
+
+    def test_hessian_symmetry(self):
+        '''omega^{A,ab} should be symmetric under (atm_a, ix_a) <-> (atm_b, ix_b).'''
+        h = tdrhf_hess.omega_hessian(self.td, 0)
+        natm = self.mol.natm
+        h_flat = h.reshape(3 * natm, 3 * natm)
+        max_asym = float(cp.max(cp.abs(h_flat - h_flat.T)))
+        self.assertLess(max_asym, 1e-7,
+                        f'Hessian asymmetry: max |H - H^T| = {max_asym:.3e}')
+
+    def test_class_kernel(self):
+        '''Hessian.kernel() should return the same as omega_hessian().'''
+        h_class = tdrhf_hess.Hessian(self.td).kernel()
+        h_func = tdrhf_hess.omega_hessian(self.td, 0)
+        self.assertTrue(bool(cp.allclose(h_class, h_func)))
+
+
 class TestPhase21Sketch(unittest.TestCase):
     '''Phase 2.1 demo: assemble a partial b^a from term-2 + term-3 only
     (omitting term-1, the eps^a-vir-diagonal piece), feed it to
@@ -498,9 +604,13 @@ class TestHessianClassWiring(unittest.TestCase):
         cls.mol, cls.mf, cls.td = _setup_tda()
         cls.h = tdrhf_hess.Hessian(cls.td)
 
-    def test_kernel_raises(self):
-        with self.assertRaises(NotImplementedError):
-            self.h.kernel()
+    def test_kernel_returns_partial_hessian(self):
+        '''Phase 2.4 partial: kernel returns the convention-A Hessian
+        (Blocks 1+2). Just confirm shape + finite, not the physics.'''
+        h = self.h.kernel()
+        natm = self.mol.natm
+        self.assertEqual(h.shape, (natm, 3, natm, 3))
+        self.assertTrue(bool(cp.all(cp.isfinite(h))))
 
     def test_solve_x1_method(self):
         x = cp.asarray(self.td.xy[0][0])

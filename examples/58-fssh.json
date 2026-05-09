@@ -1,0 +1,34 @@
+{
+  "calcName": "h2o_fssh",
+  "molecule": {
+    "atom": [
+      ["O", [0.0000000, 0.0000000, 0.1177900]],
+      ["H", [0.0000000, 0.7554530, -0.4711600]],
+      ["H", [0.0000000, -0.7554530, -0.4711600]]
+    ],
+    "basis": "sto-3g",
+    "charge": 0,
+    "spin": 0,
+    "verbose": 4
+  },
+  "theory": {
+    "xc": "pbe0",
+    "shell": "closed"
+  },
+  "property": {
+    "analyze": true
+  },
+  "rttddft": {
+    "dt": 0.01,
+    "tmax": 1.0,
+    "fssh": {
+      "enabled": true,
+      "state": 1,
+      "nstates": 5,
+      "tda": true,
+      "decoherence": "idc",
+      "init_vel_temperature": 300.0,
+      "seed": 42
+    }
+  }
+}

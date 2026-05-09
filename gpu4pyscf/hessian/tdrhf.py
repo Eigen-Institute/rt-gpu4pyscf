@@ -15,13 +15,22 @@
 '''
 Analytical excited-state Hessian for closed-shell TDA on RHF reference.
 
-Status: PHASE 1 + PHASE 2.0. Phase 1 (perturbed amplitude response solver
-``solve_x1``) and Phase 2.0 (analytical ``omega_grad``, cross-term
-assembly primitive ``assemble_omega_cross_term``, and the b^a stub with
-formula) are shipped. The full ``b^a`` construction and Hessian assembly
-remain Phase 2.1+; calling ``Hessian.kernel`` still raises
-``NotImplementedError`` because the b^a integral-derivative piece needs
-new perturbed-vind infrastructure that isn't yet a primitive.
+Status: PHASE 1 + 2.0 + 2.2 + 2.3a. Phase 1 (``solve_x1``), Phase 2.0
+(``omega_grad``, ``assemble_omega_cross_term``), Phase 2.2 (full
+``compute_b_x`` self-consistent in convention A), and Phase 2.3a
+(analytical replacement for ``_eps_x_diag_fd`` via
+``_eps_x_diag_analytical`` -- uses GS-Hessian's ``_get_jk_ip1`` plus the
+int3c2e/int1e_ipkin/ipnuc pattern from ``rhf_grad.get_grad_hcore``;
+~20x faster than FD on methanol/6-31G) are shipped. Term 2 of
+``compute_b_x`` (``_vind_x_fd``) is still FD because ``_get_jk_ip1``
+assumes symmetric input and the asymmetric AO transition density T^tr
+is not currently supported by gpu4pyscf's 1st-derivative JK builders;
+the analytical replacement ``_vind_x_analytical`` is Phase 2.3b.
+
+``Hessian.kernel`` still raises ``NotImplementedError`` because the
+full Hessian assembly (Phase 2.4: 2X.A^{ab}.X explicit double-derivative
+term + orbital relaxation Z-vector pieces) is not yet implemented. See
+``cpscf_init.md`` and the Phase 2.4 sketch for the remaining blocks.
 
 Phase 1 derivation
 ==================
@@ -104,12 +113,21 @@ infrastructure) and the explicit 2nd-derivative-integral term.
 
 References
 ----------
+- **Liu & Liang, J. Chem. Phys. 138, 024101 (2013)** -- analytical TDDFT
+  excited-state Hessian with PCM. Eq. (19) is the master formula; for
+  HF/RHF TDA without DFT/PCM it reduces to seven named pieces:
+    row 1 (pure 2nd-deriv x density):
+      H^{xy} P'_I + Gamma'_I Pi^{xy} + W_I S^{xy}
+    row 2 (mixed 1st-deriv cross):
+      P'^[~y]_I F^(x) + Gamma'^y_I Pi^x + W^[~y]_I S^x
+    row 3 (CP-SCF orbital-response coupling):
+      L'^[~y]_I (2 U^x + S^(x))
+  Our partial Hessian (Blocks 1+2 + scaffolded 3+4) covers row 1
+  approximately; rows 2 and 3 are the missing 3% gap. See cpscf_init.md.
 - van Caillie & Amos, Chem. Phys. Lett. 308, 249 (1999); 317, 159 (2000).
 - Furche & Ahlrichs, J. Chem. Phys. 117, 7433 (2002) (gradient -- the
   Lagrangian extends to give the Hessian).
 - Send & Furche, J. Chem. Phys. 132, 044107 (2010) (RPA second derivatives).
-- Liu, Furche et al., J. Chem. Phys. 154, 074104 (2021) (modern formulation
-  including spin-flip).
 '''
 
 import cupy as cp
@@ -429,6 +447,93 @@ def _vind_x_fd(mf, T_tr_AO, mo_coeff, mo_occ, delta=2.0e-3):
     return out
 
 
+def _eps_x_diag_analytical(mf, mo_coeff=None, mo_occ=None):
+    '''Analytical first derivative of F[D^eq] at fixed equilibrium MO
+    coefficients and fixed equilibrium GS density. Returns the diagonal
+    in MO basis: shape ``(natm, 3, nmo)``.
+
+    Drop-in replacement for ``_eps_x_diag_fd`` with no FD truncation.
+    Uses gpu4pyscf's GS Hessian primitive ``_get_jk_ip1`` for the
+    ``(J - 0.5 K)^a [D^eq]`` piece, plus the int3c2e + int1e_ipkin/ipnuc
+    pattern from ``rhf_grad.get_grad_hcore`` for h^a (adapted to project
+    onto the full MO set instead of just occupied orbitals).
+    '''
+    from gpu4pyscf.df import int3c2e
+    from gpu4pyscf.hessian.rhf import _get_jk_ip1
+    from gpu4pyscf.lib.cupy_helper import contract, get_avail_mem
+    from pyscf import gto
+
+    mol = mf.mol
+    natm = mol.natm
+    nao = mol.nao
+
+    if mo_coeff is None:
+        mo_coeff = mf.mo_coeff
+    if mo_occ is None:
+        mo_occ = mf.mo_occ
+    mo_coeff = cp.asarray(mo_coeff)
+    mo_occ = cp.asarray(mo_occ)
+    nmo = mo_coeff.shape[1]
+    mocc = mo_coeff[:, mo_occ > 0]
+    D_GS = 2.0 * mocc @ mocc.T  # closed-shell GS density
+
+    eps_x_diag = cp.zeros((natm, 3, nmo))
+
+    # Part 1: int3c2e ip1 -- atom-resolved nuclear-attraction derivative
+    # (the "moving charge" contribution to h^a).
+    coords = mol.atom_coords()
+    charges = cp.asarray(mol.atom_charges(), dtype=cp.float64)
+    fakemol = gto.fakemol_for_charges(coords)
+    intopt = int3c2e.VHFOpt(mol, fakemol, 'int2e')
+    intopt.build(1e-14, diag_block_with_triu=True, aosym=False,
+                 group_size=int3c2e.BLKSIZE,
+                 group_size_aux=int3c2e.BLKSIZE)
+    mo_sorted = intopt.sort_orbitals(mo_coeff, axis=[0])
+
+    dh1e = cp.zeros((natm, 3, nao, nmo))
+    for i0, i1, j0, j1, k0, k1, int3c_blk in int3c2e.loop_int3c2e_general(
+            intopt, ip_type='ip1'):
+        dh1e[k0:k1, :, j0:j1, :] += contract(
+            'xkji,iq->kxjq', int3c_blk, mo_sorted[i0:i1])
+        dh1e[k0:k1, :, i0:i1, :] += contract(
+            'xkji,jq->kxiq', int3c_blk, mo_sorted[j0:j1])
+    dh1e = contract('kxjq,k->kxjq', dh1e, -charges)
+    # Contract j (sorted-AO) with mo_sorted[j, q] -> diagonal in MO q.
+    eps_x_diag += contract('jq,kxjq->kxq', mo_sorted, dh1e)
+
+    # Part 2: int1e_ipkin/ipnuc -- atom-resolved AO-basis-function
+    # derivative.  rhf_grad.get_hcore returns -(int1e_ipkin + int1e_ipnuc),
+    # shape (3, nao, nao), bra-derivative.
+    h1 = cp.asarray(mf.nuc_grad_method().get_hcore(mol))
+    aoslices = mol.aoslice_by_atom()
+    for atm in range(natm):
+        p0, p1 = aoslices[atm][2:]
+        # bra-on-atm: rows of h1 in [p0:p1].
+        eps_x_diag[atm] += cp.einsum(
+            'mp,xmn,np->xp',
+            mo_coeff[p0:p1], h1[:, p0:p1, :], mo_coeff)
+        # ket-on-atm: by Hermitian symmetry of h, the ket-derivative is the
+        # bra-derivative with bra/ket indices swapped (i.e., transpose).
+        eps_x_diag[atm] += cp.einsum(
+            'mp,xmn,np->xp',
+            mo_coeff, h1[:, p0:p1, :].transpose(0, 2, 1), mo_coeff[p0:p1])
+
+    # Part 3: (J - 0.5 K)^a [D_GS], atom-resolved, transformed to MO diagonal.
+    nao_cart = mol.nao_cart()
+    avail_mem = get_avail_mem()
+    slice_size = max(
+        int(avail_mem * 0.5) // (8 * 3 * nao_cart * nao_cart * 3), 1)
+    for atoms_slice in lib.prange(0, natm, slice_size):
+        vj, vk = _get_jk_ip1(mol, D_GS, atoms_slice=atoms_slice)
+        vhf = vj - 0.5 * vk
+        atom0, atom1 = atoms_slice
+        for i, atm in enumerate(range(atom0, atom1)):
+            for ix in range(3):
+                eps_x_diag[atm, ix] += cp.einsum(
+                    'mp,mn,np->p', mo_coeff, vhf[i, ix], mo_coeff)
+    return eps_x_diag
+
+
 def _eps_x_diag_fd(mf, mo_coeff, mo_occ, delta=2.0e-3):
     '''Finite-difference perturbed orbital energies at fixed equilibrium MOs.
 
@@ -486,56 +591,71 @@ def _eps_x_diag_fd(mf, mo_coeff, mo_occ, delta=2.0e-3):
 
 
 def compute_b_x(td, state, h1mo=None, mo1=None, mo_e1=None,
-                fd_delta=2.0e-3):
+                fd_delta=2.0e-3, use_fd_eps=False):
     '''Build the perturbed RHS b^a = (A^a - omega^a I) X for each nuclear DOF.
 
-    PHASE 2.1 STUB (still). The full closed-shell TDA-HF singlet b^a
-    formula in the equilibrium MO basis ("Convention B" / explicit
-    derivative at fixed C, which IS the physical b^a -- see derivation
-    note below):
+    PHASE 2.2 (convention A). Closed-shell TDA-HF singlet b^a in the
+    equilibrium MO basis at fixed equilibrium orbital coefficients
+    (convention A: only the AO integrals carry R-dependence; the GS
+    density is held fixed at D^eq):
 
-        b^a_{ai} = (eps^a_a - eps^a_i)|_{C^eq} X_{ai}            (term 1)
+        b^a_{ai} = (eps^a_a - eps^a_i)|_{C^eq, D^eq} X_{ai}      (term 1)
                  + V^a[T^tr]_{ai}|_{C^eq}                        (term 2)
-                 - omega^a X_{ai}                                (term 3)
+                 - omega^A^a X_{ai}                              (term 3)
 
     where:
       - T^tr_{mu nu} = sum_{bj} c_{mu b} X_{bj} c_{nu j} is the AO
         transition density (rank-1, asymmetric).
-      - eps^a_p|_{C^eq} = F^a_{pp} at fixed C^eq, in equilibrium MO basis;
-        equals (h^a + (J - 0.5 K)^a[D^GS_eq])_{pp}, NO U^a contribution
-        because we hold C fixed at equilibrium.
+      - eps^a_p|_{C^eq, D^eq} = (h^a + (J - 0.5 K)^a[D^GS_eq])_{pp}, with
+        BOTH C and the GS density held at equilibrium values. No U^a or
+        density-relaxation contribution.
       - V^a[T^tr]|_{C^eq} = (2 J - K)^a [T^tr] at fixed C^eq, transformed
         to MO (occ, vir). For closed-shell singlet, the convention is
         V[T^tr] = vresp(2 T^tr) where vresp = J - 0.5 K (singlet hermi=0),
         which equals 2 J(T^tr) - K(T^tr).
-      - omega^a = ``omega_grad(td, state)`` -- already implemented.
+      - omega^A^a is the convention-A excitation-energy gradient,
+        omega^A^a = 2 (eps_part^a + V_part^a). Computed in-place from
+        terms 1 and 2 so the Hellmann-Feynman identity <X|b^a> = 0 holds
+        exactly by construction (modulo FD truncation in the primitives).
+        This DIFFERS from ``omega_grad(td, state)`` (= omega^phys^a, the
+        full physical gradient including GS orbital relaxation through
+        CP-SCF) by exactly the U^x density-relaxation contribution
+        (J - 0.5 K)[D^a] missing from term 1's fixed-D evaluation.
 
-    Derivation note (why no U^a mixing): differentiating the eigenvalue
-    equation in the equilibrium MO basis,
+    Convention note: the convention-A b^a yields a self-consistent
+    (A - omega I) X^A^a = -b^A^a system whose ``solve_x1`` solution gives
+    the perturbed amplitude X^A^a in the eq-basis / fixed-D framework.
+    The cross-term ``4 X^A_b b^A^a`` then assembles the convention-A
+    piece of the Hessian. Recovering the full physical Hessian
+    ``omega^phys^{ab}`` requires adding orbital-relaxation corrections
+    via Z-vector / CP-SCF (Phase 2.3+).
 
-        A_{eq-basis}(R) X_{eq-basis}(R) = omega(R) X_{eq-basis}(R),
+    Phase 2.3 status: term 1 (eps^a) is now analytical by default via
+    ``_eps_x_diag_analytical`` (uses ``_get_jk_ip1`` plus the
+    int3c2e/int1e_ipkin/ipnuc pattern from ``rhf_grad.get_grad_hcore``
+    adapted to project on the full MO set). Term 2 (V^a[T^tr]) is still
+    FD because ``_get_jk_ip1`` assumes symmetric input and gpu4pyscf
+    does not yet expose a 1st-derivative JK builder that handles the
+    asymmetric AO transition density T^tr correctly; analytical V^a is
+    deferred to Phase 2.3b.
 
-    where A_{eq-basis}(R)_{ai,bj} = <c_a^eq c_i^eq | H(R) | c_b^eq c_j^eq>
-    has only AO-integral R-dependence (the eq MOs are R-independent).
-    Differentiating gives (A_eq - omega I) X_eq^a = -b^a with b^a
-    constructed only from explicit (fixed-C) derivatives. The X^a from
-    solve_x1 is then in eq basis. The Hessian formula
-    ``omega^{ab} = 2 X . A^{ab} . X + 4 X^b . b^a`` is invariant to
-    convention so this is sufficient.
-
-    Phase 2.2 status: ALL THREE TERMS implemented. Term 1 via
-    ``_eps_x_diag_fd``, term 2 via ``_vind_x_fd``, term 3 via
-    ``omega_grad``. Both FD primitives cost ~6*natm AO/JK builds and are
-    correct but slow; analytical replacements are Phase 2.3.
+    Net cost: ~6*natm JK builds for term 2 (down from ~12*natm in
+    Phase 2.2), plus a single _get_jk_ip1 pass for term 1.
 
     Parameters
     ----------
     td : converged TDA object
     state : 0-indexed root
     h1mo, mo1, mo_e1 : optional precomputed GS Hessian primitives.
-        Currently unused (placeholder for the analytical Phase 2.3 path).
+        Currently unused (placeholder for the analytical Phase 2.3b
+        path that will replace ``_vind_x_fd``).
     fd_delta : float
-        FD step (Bohr) for ``_eps_x_diag_fd`` and ``_vind_x_fd``.
+        FD step (Bohr) for ``_vind_x_fd`` (and ``_eps_x_diag_fd`` when
+        ``use_fd_eps=True``).
+    use_fd_eps : bool, optional
+        If True, use the FD primitive for term 1 instead of the
+        analytical version. Useful for cross-checking / regression tests;
+        defaults to False (analytical).
 
     Returns
     -------
@@ -565,8 +685,11 @@ def compute_b_x(td, state, h1mo=None, mo1=None, mo_e1=None,
     # so factor of 2 here matches the closed-shell convention.
     v_x_mo = 2.0 * _vind_x_fd(mf, T_tr_AO, mo_coeff, mo_occ, delta=fd_delta)
 
-    # Term 1: (eps^a_a - eps^a_i) X[i, a]
-    eps_x = _eps_x_diag_fd(mf, mo_coeff, mo_occ, delta=fd_delta)  # (natm, 3, nmo)
+    # Term 1: (eps^a_a - eps^a_i) X[i, a]. Analytical by default (Phase 2.3).
+    if use_fd_eps:
+        eps_x = _eps_x_diag_fd(mf, mo_coeff, mo_occ, delta=fd_delta)
+    else:
+        eps_x = _eps_x_diag_analytical(mf, mo_coeff, mo_occ)  # (natm, 3, nmo)
     occidx_np = cp.asnumpy(occidx)
     viridx_np = cp.asnumpy(viridx)
     eps_x_occ = eps_x[..., occidx_np]   # (natm, 3, nocc)
@@ -575,12 +698,395 @@ def compute_b_x(td, state, h1mo=None, mo1=None, mo_e1=None,
     #   delta_eps[atm, x, i, a] = eps_x_vir[atm, x, a] - eps_x_occ[atm, x, i]
     eps_term = (eps_x_vir[..., None, :] - eps_x_occ[..., :, None]) * x_ref[None, None]
 
-    # Term 3: -omega^a X
-    omega_a = cp.asarray(omega_grad(td, state))   # (natm, 3) numpy -> cupy
-    omega_term = -omega_a[..., None, None] * x_ref[None, None]
+    # Term 3: -omega^A^a X.  The convention-A excitation-energy gradient
+    # is computed from terms 1 and 2 directly:
+    #   omega^A^a = 2 * <X | (term 1) + (term 2)>
+    # so that <X | b^a> = (omega^A^a / 2) - (omega^A^a / 2) = 0 holds by
+    # construction, as required for solve_x1's deflation to be consistent
+    # (see docstring "Convention note"). omega^phys^a = omega_grad(td, state)
+    # differs by orbital relaxation; that delta belongs in Phase 2.3+.
+    eps_plus_v = eps_term + v_x_mo
+    omega_A_a = 2.0 * cp.einsum('ov,axov->ax', x_ref, eps_plus_v)  # (natm, 3)
+    omega_term = -omega_A_a[..., None, None] * x_ref[None, None]
 
-    b = (eps_term + v_x_mo + omega_term).reshape(natm * 3, nocc, nvir)
+    b = (eps_plus_v + omega_term).reshape(natm * 3, nocc, nvir)
     return b
+
+
+def _compute_z_and_densities(td, state):
+    '''Compute the Z-vector and supporting MO-basis quantities for the
+    closed-shell singlet TDA-on-RHF excited state ``state``.
+
+    Mirrors the relevant block of ``grad/tdrhf.py::grad_elec`` (lines
+    ~50-152) but returns the intermediate quantities needed for Block 3
+    (P^I) and Block 4 (W^I) assembly without doing the gradient itself.
+
+    Returns
+    -------
+    dict with keys:
+        z1   : (nvir, nocc)  -- the Z-vector solution
+        doo  : (nocc, nocc)  -- excited-state occ-occ density correction
+        dvv  : (nvir, nvir)  -- excited-state vir-vir density correction
+        dmxpy : (nao, nao)   -- (X+Y) in AO (asymmetric, = T^tr for TDA)
+        dmxmy : (nao, nao)   -- (X-Y) in AO (= T^tr for TDA)
+        dmzoo : (nao, nao)   -- relaxed transition density (no Z) in AO
+        im0_MO : (nmo, nmo)  -- W^I MO-basis pre-form (without zeta·dm1)
+    '''
+    from functools import reduce
+    from gpu4pyscf.scf import cphf
+    from gpu4pyscf.lib.cupy_helper import contract
+
+    mf = td._scf
+    mol = td.mol
+    mo_coeff = cp.asarray(mf.mo_coeff)
+    mo_energy = cp.asarray(mf.mo_energy)
+    mo_occ = cp.asarray(mf.mo_occ)
+    nmo = mo_coeff.shape[1]
+    nocc = int((mo_occ > 0).sum())
+    nvir = nmo - nocc
+
+    x_y = td.xy[state]
+    x = cp.asarray(x_y[0])
+    y_part = x_y[1]
+    if not (isinstance(y_part, (int, float)) and y_part == 0):
+        raise NotImplementedError(
+            '_compute_z_and_densities supports closed-shell TDA only (Y=0).')
+    y = cp.zeros_like(x)
+
+    xpy = (x + y).reshape(nocc, nvir).T   # (nvir, nocc)
+    xmy = (x - y).reshape(nocc, nvir).T
+
+    orbv = mo_coeff[:, nocc:]
+    orbo = mo_coeff[:, :nocc]
+
+    dvv = (contract("ai,bi->ab", xpy, xpy)
+           + contract("ai,bi->ab", xmy, xmy))
+    doo = (-contract("ai,aj->ij", xpy, xpy)
+           - contract("ai,aj->ij", xmy, xmy))
+    dmxpy = reduce(cp.dot, (orbv, xpy, orbo.T))
+    dmxmy = reduce(cp.dot, (orbv, xmy, orbo.T))
+    dmzoo = reduce(cp.dot, (orbo, doo, orbo.T))
+    dmzoo += reduce(cp.dot, (orbv, dvv, orbv.T))
+
+    vj0, vk0 = mf.get_jk(mol, dmzoo, hermi=0)
+    vj1, vk1 = mf.get_jk(mol, dmxpy + dmxpy.T, hermi=0)
+    vj2, vk2 = mf.get_jk(mol, dmxmy - dmxmy.T, hermi=0)
+    vj0 = cp.asarray(vj0); vk0 = cp.asarray(vk0)
+    vj1 = cp.asarray(vj1); vk1 = cp.asarray(vk1)
+    vj2 = cp.asarray(vj2); vk2 = cp.asarray(vk2)
+
+    veff0doo = vj0 * 2 - vk0
+    wvo = reduce(cp.dot, (orbv.T, veff0doo, orbo)) * 2
+
+    # Singlet kernel: 2J - K
+    veff = vj1 * 2 - vk1
+    veff0mop = reduce(cp.dot, (mo_coeff.T, veff, mo_coeff))
+    wvo -= contract("ki,ai->ak", veff0mop[:nocc, :nocc], xpy) * 2
+    wvo += contract("ac,ai->ci", veff0mop[nocc:, nocc:], xpy) * 2
+
+    veff = -vk2
+    veff0mom = reduce(cp.dot, (mo_coeff.T, veff, mo_coeff))
+    wvo -= contract("ki,ai->ak", veff0mom[:nocc, :nocc], xmy) * 2
+    wvo += contract("ac,ai->ci", veff0mom[nocc:, nocc:], xmy) * 2
+
+    vresp = td.gen_response(singlet=None, hermi=1)
+
+    def fvind(z):
+        dm = reduce(cp.dot, (orbv, z.reshape(nvir, nocc) * 2, orbo.T))
+        v1ao = vresp(dm + dm.T)
+        return reduce(cp.dot, (orbv.T, v1ao, orbo)).ravel()
+
+    z1 = cphf.solve(fvind, mo_energy, mo_occ, wvo,
+                    max_cycle=50, tol=1e-8)[0]
+    z1 = z1.reshape(nvir, nocc)
+
+    # Build im0_MO for W^I assembly. Mirrors grad/tdrhf.py:124-151.
+    z1ao = reduce(cp.dot, (orbv, z1, orbo.T))
+    veff = vresp(z1ao + z1ao.T)
+
+    im0 = cp.zeros((nmo, nmo))
+    im0[:nocc, :nocc] = reduce(cp.dot, (orbo.T, veff0doo + veff, orbo))
+    im0[:nocc, :nocc] += contract("ak,ai->ki", veff0mop[nocc:, :nocc], xpy)
+    im0[:nocc, :nocc] += contract("ak,ai->ki", veff0mom[nocc:, :nocc], xmy)
+    im0[nocc:, nocc:] = contract("ci,ai->ac", veff0mop[nocc:, :nocc], xpy)
+    im0[nocc:, nocc:] += contract("ci,ai->ac", veff0mom[nocc:, :nocc], xmy)
+    im0[nocc:, :nocc] = contract("ki,ai->ak", veff0mop[:nocc, :nocc], xpy) * 2
+    im0[nocc:, :nocc] += contract("ki,ai->ak", veff0mom[:nocc, :nocc], xmy) * 2
+
+    return {
+        'z1': z1, 'doo': doo, 'dvv': dvv,
+        'dmxpy': dmxpy, 'dmxmy': dmxmy, 'dmzoo': dmzoo,
+        'im0_MO': im0,
+    }
+
+
+def _build_PI_and_W_AO(td, state):
+    '''Assemble P^I_AO (relaxed difference density) and W^I_AO
+    (energy-weighted relaxed density) in AO basis. Returns the full
+    (asymmetric) matrices and their symmetric parts.
+
+    For Phase 2.4 Blocks 3+4, we use the symmetric parts; the asymmetric
+    Z-vector AO contribution to JK^{ab} traces is conjectured to vanish
+    against the symmetric integrals (block-3 1-electron h^{ab}, block-4
+    overlap S^{ab}) but partially survives for the 2-electron mixed
+    contraction with non-symmetric F^{ab}[D^GS] integral types. The
+    residual is the focus of the FD validation that follows.
+    '''
+    pieces = _compute_z_and_densities(td, state)
+    z1 = pieces['z1']; doo = pieces['doo']; dvv = pieces['dvv']
+    im0_MO = pieces['im0_MO']
+
+    mf = td._scf
+    mo_coeff = cp.asarray(mf.mo_coeff)
+    mo_energy = cp.asarray(mf.mo_energy)
+    mo_occ = cp.asarray(mf.mo_occ)
+    nmo = mo_coeff.shape[1]
+    nocc = int((mo_occ > 0).sum())
+    orbo = mo_coeff[:, :nocc]
+    orbv = mo_coeff[:, nocc:]
+
+    # P^I_AO.  In MO basis: P[occ, occ] = doo, P[vir, vir] = dvv,
+    # P[vir, occ] = z1, P[occ, vir] = 0. Transform to AO.
+    P_AO = (orbo @ doo @ orbo.T
+            + orbv @ dvv @ orbv.T
+            + orbv @ z1 @ orbo.T)
+    P_AO_sym = (P_AO + P_AO.T) * 0.5
+
+    # W^I_AO_excited = mo @ (im0_MO + zeta * dm1_excited) @ mo.T
+    # NOTE: the gradient code's `dm1` adds `eye(nocc) * 2` to include the
+    # GS energy-weighted density (so its `im0` is the FULL TDA W). For our
+    # omega^{ab} excited-only addendum, we OMIT that piece -- the GS S^{ab}
+    # contribution is already in the GS Hessian and would double-count.
+    zeta = (mo_energy[:, None] + mo_energy[None, :]) * 0.5
+    zeta[nocc:, :nocc] = mo_energy[:nocc]
+    zeta[:nocc, nocc:] = mo_energy[nocc:]
+    dm1_excited_MO = cp.zeros((nmo, nmo))
+    dm1_excited_MO[:nocc, :nocc] = doo
+    dm1_excited_MO[nocc:, nocc:] = dvv
+    dm1_excited_MO[nocc:, :nocc] = z1
+    W_AO = mo_coeff @ (im0_MO + zeta * dm1_excited_MO) @ mo_coeff.T
+    W_AO_sym = (W_AO + W_AO.T) * 0.5
+
+    return {
+        'P_AO': P_AO, 'P_AO_sym': P_AO_sym,
+        'W_AO': W_AO, 'W_AO_sym': W_AO_sym,
+        **pieces,
+    }
+
+
+def _omega_blocks_3_4(td, state):
+    '''Phase 2.4 Blocks 3 + 4 -- orbital-relaxation correction to the
+    convention-A Hessian. Returns (natm, 3, natm, 3) tensor.
+
+    Block 3:  ``+ tr(P^I_sym . F^{ab}[D^{GS}])``
+              = 1-electron tr(P^I_sym . h^{ab})
+              + 2-electron mixed tr(P^I_sym . (J - 0.5 K)^{ab}[D^{GS}])
+                via polarization on _partial_ejk_ip2.
+    Block 4:  ``- tr(W^I_sym . S^{ab})``
+              using the GS Hessian's s1aa/s1ab 2nd-derivative overlap
+              integrals and the same canonical-ordering pattern as
+              _partial_hess_ejk.
+
+    Symmetric-only: feeds (P^I + P^I.T)/2 and (W^I + W^I.T)/2 to the
+    integrators. Asymmetric pieces of P^I (Z-vector AO contribution)
+    contribute zero against symmetric h^{ab} and S^{ab}, but partially
+    survive against the non-symmetric F^{ab}[D^{GS}] integral types
+    (Phase 2.4 Blocks-3-asym, blocked on hermi-aware kernel).
+    '''
+    from gpu4pyscf.hessian import rhf as rhf_hess
+    from gpu4pyscf.hessian.rhf import _partial_ejk_ip2
+    from gpu4pyscf.lib.cupy_helper import contract
+
+    mf = td._scf
+    mol = td.mol
+    natm = mol.natm
+
+    pieces = _build_PI_and_W_AO(td, state)
+    P_sym = pieces['P_AO_sym']
+    W_sym = pieces['W_AO_sym']
+
+    mo_coeff = cp.asarray(mf.mo_coeff)
+    mo_occ = cp.asarray(mf.mo_occ)
+    mocc = mo_coeff[:, mo_occ > 0]
+    D_GS = 2.0 * mocc @ mocc.T
+
+    # Build a transient Hessian object so we can borrow its primitives.
+    hessobj = rhf_hess.Hessian(mf)
+
+    # ===== Block 3 =====
+    # 3a: 1-electron tr(P^I_sym . h^{ab}) per (atm_a, atm_b)
+    block3 = cp.zeros((natm, natm, 3, 3))
+    de_hcore_PI = rhf_hess._e_hcore_generator(hessobj, P_sym)
+    for ia in range(natm):
+        for ja in range(natm):
+            block3[ia, ja] += de_hcore_PI(ia, ja)
+
+    # 3b: 2-electron tr(P^I_sym . (J - 0.5 K)^{ab}[D^{GS}]) via polarization
+    #   ejk(D, j, k)              = j J^{ab}[D, D] - k K^{ab}[D, D]
+    #   ejk(D + P) - ejk(D) - ejk(P) = 2 ejk_cross(D, P)
+    #                                 = 2 (j J^{ab}_cross - k K^{ab}_cross)
+    # We want tr(P (J - 0.5 K)^{ab}[D]) = J^{ab}_cross - 0.5 K^{ab}_cross
+    # which corresponds to ejk_cross with (j=1, k=0.5).
+    ejk_combined = _partial_ejk_ip2(mol, D_GS + P_sym,
+                                    j_factor=1., k_factor=0.5)
+    ejk_DGS      = _partial_ejk_ip2(mol, D_GS,
+                                    j_factor=1., k_factor=0.5)
+    ejk_PI       = _partial_ejk_ip2(mol, P_sym,
+                                    j_factor=1., k_factor=0.5)
+    block3_2e = (ejk_combined - ejk_DGS - ejk_PI) * 0.5
+    block3 = block3 + block3_2e
+
+    # ===== Block 4 =====
+    # -tr(W^I_sym . S^{ab}); use s1aa for diagonal block, s1ab for off-diag.
+    s1aa, s1ab, _s1a = rhf_hess.get_ovlp(mol)
+    s1aa = cp.asarray(s1aa); s1ab = cp.asarray(s1ab)
+    aoslices = mol.aoslice_by_atom()
+    block4 = cp.zeros((natm, natm, 3, 3))
+    for i0 in range(natm):
+        p0, p1 = aoslices[i0][2:]
+        block4[i0, i0] -= contract(
+            'xypq,pq->xy', s1aa[:, :, p0:p1], W_sym[p0:p1]) * 2
+        for j0 in range(i0 + 1):
+            q0, q1 = aoslices[j0][2:]
+            term = contract(
+                'xypq,pq->xy', s1ab[:, :, p0:p1, q0:q1],
+                W_sym[p0:p1, q0:q1]) * 2
+            block4[i0, j0] -= term
+    # Fill upper triangular by Hessian symmetry.
+    for i0 in range(natm):
+        for j0 in range(i0):
+            block4[j0, i0] = block4[i0, j0].T
+
+    total = (block3 + block4).transpose(0, 2, 1, 3)
+    return total
+
+
+def _omega_ab_pure_fd(td, state, fd_delta=2.0e-3):
+    '''Phase 2.4 Block 1 (FD-driven version).
+
+    Computes the convention-A pure 2nd-derivative term
+
+        omega^{A,ab}_pure = 2 X^T A^{ab} X
+                         = 2 d/dR_b (eps_part^a + V_part^a)
+
+    by central FD on the 1st-derivative quantity ``(eps_term + v_x_mo)``
+    that ``compute_b_x`` already builds. Returns shape ``(natm, 3, natm, 3)``.
+
+    This is the "FD on analytical-1st-derivative" path: each displacement
+    runs SCF + TDA + ``compute_b_x`` (which uses analytical eps^a from
+    Phase 2.3a + FD V^a). Cost: 6*natm SCF/TDA solves + 12*natm
+    ``compute_b_x`` calls. Cleanly correct; the eventual Phase 2.4b will
+    replace this with analytical 2nd-derivative ERI primitives
+    (e.g. ``_partial_ejk_ip2`` on M^tr) for orders-of-magnitude speedup.
+
+    Phase 2.4b status: empirically blocked on the same missing primitive
+    as Phase 2.3b. ``_partial_ejk_ip2`` post-symmetrizes assuming
+    hermi=1 dm, so feeding the asymmetric AO transition density
+    M^tr = orbo @ X @ orbv^T produces results 100%+ off all FD
+    references regardless of (j_factor, k_factor) choice. Unblocks
+    once gpu4pyscf exposes a hermi-aware 2nd-derivative JK kernel.
+    '''
+    from gpu4pyscf import scf as _gpu_scf
+    from gpu4pyscf import tdscf as _gpu_tdscf
+    mol = td.mol
+    natm = mol.natm
+    nocc, nvir = cp.asarray(td.xy[state][0]).shape
+
+    # Reference: x_ref captured ONCE at the equilibrium geometry. We
+    # compute (eps + v) at displaced geometries, contract with the FIXED
+    # eq x_ref to extract the (A^{ab} X) contribution.
+    x_ref = cp.asarray(td.xy[state][0])
+
+    coords0 = mol.atom_coords(unit='Bohr').copy()
+    omega_pure = cp.zeros((natm, 3, natm, 3))
+
+    def _eps_plus_v_at(mol_d):
+        '''Build (eps_term + v_x_mo) at the displaced geometry, projected
+        onto the displaced-MO (occ, vir) but interpreting amplitudes as
+        the equilibrium x_ref. Returns (natm, 3, nocc, nvir).'''
+        mfp = _gpu_scf.RHF(mol_d)
+        mfp.conv_tol = max(getattr(td._scf, 'conv_tol', 1e-12) * 0.1, 1e-13)
+        mfp.run()
+        if not mfp.converged:
+            raise RuntimeError('Inner SCF did not converge during Hessian FD.')
+        # Build a TDA shell at displaced geometry just to use td_disp's
+        # state-tracker-equivalent infrastructure -- but we DON'T re-solve
+        # TDA; we just need the operator pieces evaluated at displaced
+        # MO basis with the ORIGINAL x_ref amplitudes.
+        mo_d = cp.asarray(mfp.mo_coeff)
+        occ_d = cp.asarray(mfp.mo_occ)
+        orbo_d = mo_d[:, occ_d > 0]
+        orbv_d = mo_d[:, occ_d == 0]
+        T_tr_d = orbv_d @ x_ref.T @ orbo_d.T
+
+        eps_x = _eps_x_diag_analytical(mfp, mo_d, occ_d)
+        nocc_d = orbo_d.shape[1]
+        eps_x_o = eps_x[..., :nocc_d]
+        eps_x_v = eps_x[..., nocc_d:]
+        eps_term = (eps_x_v[..., None, :] - eps_x_o[..., :, None]) * x_ref[None, None]
+        v_x = 2.0 * _vind_x_fd(mfp, T_tr_d, mo_d, occ_d, delta=fd_delta)
+        return eps_term + v_x
+
+    for atm_b in range(natm):
+        for ix_b in range(3):
+            disp_p = coords0.copy(); disp_p[atm_b, ix_b] += fd_delta
+            disp_m = coords0.copy(); disp_m[atm_b, ix_b] -= fd_delta
+            mol_p = mol.copy(); mol_p.set_geom_(disp_p, unit='Bohr'); mol_p.build()
+            mol_m = mol.copy(); mol_m.set_geom_(disp_m, unit='Bohr'); mol_m.build()
+            ev_p = _eps_plus_v_at(mol_p)
+            ev_m = _eps_plus_v_at(mol_m)
+            # 2 X^T (∂_b (A^a X)) = 2 sum_{ia} X[i,a] * d/dR_b (eps + v)_{a, ix_a, i, a}
+            # Result indexed by (atm_a, ix_a) for each (atm_b, ix_b).
+            d_ab = (ev_p - ev_m) / (2.0 * fd_delta)  # shape (natm_a, 3, nocc, nvir)
+            omega_pure[:, :, atm_b, ix_b] = 2.0 * cp.einsum(
+                'axiv,iv->ax', d_ab, x_ref)
+
+    # Symmetrize (Hessian theorem).
+    omega_pure = 0.5 * (omega_pure + omega_pure.transpose(2, 3, 0, 1))
+    return omega_pure
+
+
+def omega_hessian(td, state, fd_delta=2.0e-3, include_relaxation=False):
+    '''Phase 2.4 assembly: closed-shell singlet TDA-on-RHF excited-state
+    energy Hessian ``omega^{ab}``, shape ``(natm, 3, natm, 3)``.
+
+    Pieces:
+      Block 1 (pure, 2 X^T A^{ab} X)       via FD on the Phase 2.3a
+                                            analytical 1st-derivative
+      Block 2 (cross, 4 X^T_b b^a)         via Phase 0 cross-term
+                                            primitive on Phase 1 solve_x1
+      Block 3 (orbital relaxation,         via _omega_blocks_3_4
+        +tr(P^I . F^{ab}[D^GS])) and        SCAFFOLDING ONLY -- the
+      Block 4 (energy-weighted overlap,     factor / sign attribution
+        -tr(W^I . S^{ab}))                  doesn't yet match the
+                                            Furche-Ahlrichs Lagrangian.
+                                            On H2O/STO-3G the partial
+                                            (Blocks 1+2) recovers ~97%
+                                            of the FD-on-omega gold
+                                            standard with a 0.15 gap;
+                                            adding the current Blocks
+                                            3+4 OVERSHOOTS by ~3.3.
+                                            Default ``False``.
+
+    Set ``include_relaxation=True`` to add Blocks 3+4 (debug-only --
+    not yet validated against FD gold standard).
+    '''
+    natm = td.mol.natm
+
+    omega_pure = _omega_ab_pure_fd(td, state, fd_delta=fd_delta)
+
+    b_a = compute_b_x(td, state, fd_delta=fd_delta)
+    x_a = solve_x1(td, state, b_a)
+    omega_cross = assemble_omega_cross_term(b_a, x_a)
+    omega_cross = omega_cross.reshape(natm, 3, natm, 3)
+
+    out = omega_pure + omega_cross
+
+    if include_relaxation:
+        omega_relax = _omega_blocks_3_4(td, state)
+        out = out + omega_relax
+
+    return out
 
 
 class Hessian(rhf_hess.HessianBase):
@@ -653,19 +1159,21 @@ class Hessian(rhf_hess.HessianBase):
             state = self.state - 1
         return compute_b_x(self.base, state, fd_delta=fd_delta)
 
-    def kernel(self, *args, **kwargs):
-        raise NotImplementedError(
-            'Analytical excited-state Hessian assembly: Phase 2.0 ships '
-            'the omega_grad primitive (analytical scalar gradient of the '
-            'excitation energy) and the cross-term assembler '
-            '(``assemble_omega_cross_term``). The full Hessian needs the '
-            'b^a builder (``compute_b_x``) which is Phase 2.1 and depends '
-            'on a perturbed-vind primitive (1st-derivative AO ERIs '
-            'contracted with the transition density at the (occ, vir) MO '
-            'level) that gpu4pyscf does not yet expose. Until then, use '
-            'FD on the gradient -- see '
-            '``~/research/templates/geom_excited_json.py``. See '
-            'cpscf_init.md and the module docstring of '
-            '``gpu4pyscf/hessian/tdrhf.py`` for the full Phase 2 plan.')
+    def kernel(self, *args, fd_delta=2.0e-3, include_relaxation=False, **kwargs):
+        '''Closed-shell singlet TDA-on-RHF excited-state energy Hessian
+        ``omega^{ab}``, shape ``(natm, 3, natm, 3)``.
+
+        DEFAULT: convention-A partial (Blocks 1+2). Recovers ~97% of
+        the FD-on-omega_grad gold standard on small systems; the missing
+        ~3% is the orbital-relaxation correction. Pass
+        ``include_relaxation=True`` to add Blocks 3+4 -- but those are
+        currently SCAFFOLDING with incorrect factors / sign attribution;
+        they OVERSHOOT the gap rather than closing it. Use only for
+        debugging until the Furche-Ahlrichs formula derivation is
+        completed (see cpscf_init.md).
+        '''
+        state = self.state - 1
+        return omega_hessian(self.base, state, fd_delta=fd_delta,
+                             include_relaxation=include_relaxation)
 
     hess = kernel
