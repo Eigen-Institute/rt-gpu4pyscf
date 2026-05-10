@@ -155,63 +155,79 @@ if want_hess or want_vib:
               f"(should be < ~1e-3 if opt converged)")
 
         step = float(excited.get("fd_step_bohr", 0.005))
-        allow_bad = bool(excited.get("allow_bad_match", False))
-        tda = bool(excited.get("tda", True))
-        nstates_d = int(excited.get("nstates", max(state_ref, 5)))
+        method = geomopt.get("method", "FD").upper()
+        
+        if method == "SA":
+            print(f"\nSemi-analytical excited-state Hessian (SA):")
+            from gpu4pyscf.hessian import tdrhf as tdrhf_hess
+            # state_ref is 1-indexed in JSON, but our implementation expects 0-indexed state in kernel
+            # wait, my Hessian class has self.state = 1 default.
+            # let's use the object interface
+            h_obj = tdrhf_hess.Hessian(td)
+            h_obj.state = state_ref
+            t0 = time.time()
+            hessian = h_obj.kernel(fd_delta=step)
+            # Ensure numpy format for subsequent analysis
+            hessian = np.asarray(hessian.get())
+            print(f"Semi-analytical Hessian time: {time.time() - t0:.1f} s")
+        else:
+            allow_bad = bool(excited.get("allow_bad_match", False))
+            tda = bool(excited.get("tda", True))
+            nstates_d = int(excited.get("nstates", max(state_ref, 5)))
 
-        natoms = mol_eq.natm
-        coords_bohr = mol_eq.atom_coords(unit="Bohr").copy()
-        hessian = np.zeros((natoms, natoms, 3, 3))
+            natoms = mol_eq.natm
+            coords_bohr = mol_eq.atom_coords(unit="Bohr").copy()
+            hessian = np.zeros((natoms, natoms, 3, 3))
 
-        print(f"\nNumerical excited-state Hessian: "
-              f"{2 * 3 * natoms} gradient evaluations, step = {step} Bohr")
-        t0 = time.time()
-        for i in range(natoms):
-            for a in range(3):
-                for sign in (+1, -1):
-                    disp = coords_bohr.copy()
-                    disp[i, a] += sign * step
-                    mol_disp = mol_eq.set_geom_(disp, unit="Bohr", inplace=False)
+            print(f"\nNumerical excited-state Hessian (FD): "
+                  f"{2 * 3 * natoms} gradient evaluations, step = {step} Bohr")
+            t0 = time.time()
+            for i in range(natoms):
+                for a in range(3):
+                    for sign in (+1, -1):
+                        disp = coords_bohr.copy()
+                        disp[i, a] += sign * step
+                        mol_disp = mol_eq.set_geom_(disp, unit="Bohr", inplace=False)
 
-                    # Re-converge SCF + TDDFT at displaced geometry
-                    ks_d = ks.copy(); ks_d.reset(mol_disp); ks_d.kernel()
-                    if not ks_d.converged:
-                        raise RuntimeError(
-                            f"SCF did not converge at coord ({i},{a},{sign:+d}).")
-                    td_d = ks_d.TDA() if tda else ks_d.TDDFT()
-                    td_d.nstates = nstates_d
-                    td_d.kernel()
+                        # Re-converge SCF + TDDFT at displaced geometry
+                        ks_d = ks.copy(); ks_d.reset(mol_disp); ks_d.kernel()
+                        if not ks_d.converged:
+                            raise RuntimeError(
+                                f"SCF did not converge at coord ({i},{a},{sign:+d}).")
+                        td_d = ks_d.TDA() if tda else ks_d.TDDFT()
+                        td_d.nstates = nstates_d
+                        td_d.kernel()
 
-                    match = tracker.assign(td_d)
-                    bad = set(match.flags) & {'low_overlap', 'energy_jump'}
-                    if bad and not allow_bad:
-                        raise RuntimeError(
-                            f"State-tracking flags at ({i},{a},{sign:+d}): "
-                            f"{match.flags}; |S|={match.overlap:.3f}, "
-                            f"runner_up={match.runner_up}, "
-                            f"|dE|={match.de_target:.3e} Ha. "
-                            f"Set excited.allow_bad_match=true to override.")
-                    print(f"  ({i},{a},{sign:+d}): root={match.state_1indexed()} "
-                          f"|S|={match.overlap:.3f} runner-up={match.runner_up} "
-                          f"flags={match.flags or ['ok']}")
+                        match = tracker.assign(td_d)
+                        bad = set(match.flags) & {'low_overlap', 'energy_jump'}
+                        if bad and not allow_bad:
+                            raise RuntimeError(
+                                f"State-tracking flags at ({i},{a},{sign:+d}): "
+                                f"{match.flags}; |S|={match.overlap:.3f}, "
+                                f"runner_up={match.runner_up}, "
+                                f"|dE|={match.de_target:.3e} Ha. "
+                                f"Set excited.allow_bad_match=true to override.")
+                        print(f"  ({i},{a},{sign:+d}): root={match.state_1indexed()} "
+                              f"|S|={match.overlap:.3f} runner-up={match.runner_up} "
+                              f"flags={match.flags or ['ok']}")
 
-                    g = np.asarray(td_d.nuc_grad_method().kernel(
-                        state=match.state_1indexed()))
+                        g = np.asarray(td_d.nuc_grad_method().kernel(
+                            state=match.state_1indexed()))
 
-                    if sign == +1:
-                        g_plus = g
-                    else:
-                        # H_{i a, j b} ~ (g_plus - g_minus) / (2 * step)
-                        d_g = (g_plus - g) / (2.0 * step)
-                        hessian[i, :, a, :] = d_g
-                idx = 3 * i + a + 1
-                print(f"  coord {idx}/{3 * natoms} done "
-                      f"(t = {time.time() - t0:.1f} s)")
-        # Symmetrize  H_{iajb} = H_{jbia}
-        H_flat = hessian.transpose(0, 2, 1, 3).reshape(3 * natoms, 3 * natoms)
-        H_flat = 0.5 * (H_flat + H_flat.T)
-        hessian = H_flat.reshape(natoms, 3, natoms, 3).transpose(0, 2, 1, 3)
-        print(f"Numerical Hessian time: {time.time() - t0:.1f} s")
+                        if sign == +1:
+                            g_plus = g
+                        else:
+                            # H_{i a, j b} ~ (g_plus - g_minus) / (2 * step)
+                            d_g = (g_plus - g) / (2.0 * step)
+                            hessian[i, :, a, :] = d_g
+                    idx = 3 * i + a + 1
+                    print(f"  coord {idx}/{3 * natoms} done "
+                          f"(t = {time.time() - t0:.1f} s)")
+            # Symmetrize  H_{iajb} = H_{jbia}
+            H_flat = hessian.transpose(0, 2, 1, 3).reshape(3 * natoms, 3 * natoms)
+            H_flat = 0.5 * (H_flat + H_flat.T)
+            hessian = H_flat.reshape(natoms, 3, natoms, 3).transpose(0, 2, 1, 3)
+            print(f"Numerical Hessian time: {time.time() - t0:.1f} s")
 
     if want_hess:
         hess_file = f"{calc_name}_hessian.npy"

@@ -1,0 +1,29 @@
+{
+  "calcName": "phen-m1_geom-5",
+  "molecule": {
+    "atom": "phen-m1_opt.xyz",
+    "basis": "def2-svp",
+    "charge": -1,
+    "spin": 1,
+    "verbose": 4
+  },
+  "theory": {
+    "xc": "pbe0",
+    "shell": "open",
+    "initial guess": "phen-m1.chk"
+  },
+  "excited": {
+    "state": 5,
+    "nstates": 20,
+    "fd_step_bohr": 0.005
+  },
+  "geomopt": {
+    "method": "SA",
+    "maxsteps": 100,
+    "output_file": "phen-m1-5_opt.xyz"
+  },
+  "properties": {
+    "Hessian": true,
+    "vib": true
+  }
+}
