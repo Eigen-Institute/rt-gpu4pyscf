@@ -37,8 +37,6 @@ from pyscf.hessian import thermo
 from gpu4pyscf import dft
 from gpu4pyscf.tdscf.state_tracking import TransitionDensityTracker
 
-sys.path.append("/home/craig/research/templates/eigen")
-import footer  # noqa: E402
 
 start_time = time.time()
 
@@ -260,4 +258,3 @@ if want_hess or want_vib:
         print(f"Vibrational results -> {calc_name}_vib.json")
 
 print(f"\n     wall time: {time.time() - start_time:.1f} s")
-footer.print_footer()
